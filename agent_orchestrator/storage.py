@@ -52,6 +52,13 @@ class Store:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS agent_configs (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, instructions TEXT NOT NULL,
+                    expected_result TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -151,3 +158,42 @@ class Store:
                 (agent_id,),
             ).fetchone()
             return row is not None
+
+    def save_agent_config(self, value: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO agent_configs(id, name, instructions, expected_result, updated_at)
+                VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name, instructions=excluded.instructions,
+                  expected_result=excluded.expected_result, updated_at=CURRENT_TIMESTAMP""",
+                (value["id"], value["name"], value["instructions"], value.get("expected_result", "")),
+            )
+
+    def agent_config(self, agent_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_configs WHERE id = ?", (agent_id,)
+            ).fetchone()
+            return self._agent_config(row) if row else None
+
+    def agent_configs(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            return [
+                self._agent_config(row)
+                for row in connection.execute("SELECT * FROM agent_configs ORDER BY updated_at DESC")
+            ]
+
+    @staticmethod
+    def _agent_config(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "instructions": row["instructions"],
+            "expected_result": row["expected_result"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def delete_agent_config(self, agent_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute("DELETE FROM agent_configs WHERE id = ?", (agent_id,))

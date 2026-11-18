@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -49,6 +50,24 @@ class AgentRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: Annotated[str, Field(min_length=1, max_length=20_000)]
+
+
+class SubmitForReviewRequest(BaseModel):
+    prompt: Annotated[str, Field(min_length=1, max_length=20_000)]
+
+
+class AgentConfigRequest(BaseModel):
+    name: Annotated[str, Field(min_length=1, max_length=200)]
+    instructions: Annotated[str, Field(min_length=1, max_length=50_000)]
+    expected_result: Annotated[str, Field(default="", max_length=50_000)]
+
+    @model_validator(mode="after")
+    def validate(self) -> "AgentConfigRequest":
+        self.name = self.name.strip()
+        self.instructions = self.instructions.strip()
+        if not self.name or not self.instructions:
+            raise ValueError("Name and instructions are required.")
+        return self
 
 
 def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
@@ -164,9 +183,9 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
             ) from error
 
     @application.post("/api/sessions/{session_id}/finalize")
-    async def finalize_result(session_id: str) -> dict[str, object]:
+    async def submit_for_review(session_id: str, request: SubmitForReviewRequest) -> dict[str, object]:
         try:
-            return await service.finalize_result(session_id)
+            return await service.submit_for_review(session_id, request.prompt.strip())
         except KeyError as error:
             raise HTTPException(
                 status_code=404, detail="This workflow is no longer available."
@@ -210,6 +229,45 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
             raise HTTPException(status_code=502, detail=str(error)) from error
         except WorkflowTransitionError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @application.get("/api/agent-configs")
+    async def list_agent_configs() -> list[dict[str, object]]:
+        return service.store.agent_configs()
+
+    @application.post("/api/agent-configs")
+    async def create_agent_config(request: AgentConfigRequest) -> dict[str, object]:
+        config_id = str(uuid.uuid4())
+        service.store.save_agent_config({
+            "id": config_id,
+            "name": request.name,
+            "instructions": request.instructions,
+            "expected_result": request.expected_result,
+        })
+        return service.store.agent_config(config_id)
+
+    @application.put("/api/agent-configs/{config_id}")
+    async def update_agent_config(config_id: str, request: AgentConfigRequest) -> dict[str, object]:
+        if not service.store.agent_config(config_id):
+            raise HTTPException(status_code=404, detail="Agent config not found.")
+        service.store.save_agent_config({
+            "id": config_id,
+            "name": request.name,
+            "instructions": request.instructions,
+            "expected_result": request.expected_result,
+        })
+        return service.store.agent_config(config_id)
+
+    @application.get("/api/agent-configs/{config_id}")
+    async def get_agent_config(config_id: str) -> dict[str, object]:
+        config = service.store.agent_config(config_id)
+        if not config:
+            raise HTTPException(status_code=404, detail="Agent config not found.")
+        return config
+
+    @application.delete("/api/agent-configs/{config_id}")
+    async def delete_agent_config(config_id: str) -> dict[str, str]:
+        service.store.delete_agent_config(config_id)
+        return {"status": "deleted"}
 
     if FRONTEND_DIR.is_dir():
         assets_dir = FRONTEND_DIR / "assets"

@@ -84,6 +84,10 @@ class FakeAgent:
         self.stage = "review"
         return self.get_workflow(session_id)
 
+    async def submit_for_review(self, session_id: str, prompt: str) -> dict[str, object]:
+        self.stage = "review"
+        return self.get_workflow(session_id)
+
     async def discard_workflow(self, session_id: str) -> dict[str, object]:
         self.stage = "discarded"
         return self.get_workflow(session_id)

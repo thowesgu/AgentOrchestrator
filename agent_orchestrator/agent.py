@@ -210,6 +210,61 @@ class CopilotAgentService:
             self._persist(session_id)
         return self.get_workflow(session_id)
 
+    async def submit_for_review(self, session_id: str, prompt: str) -> dict[str, object]:
+        workflow = self._require_workflow(session_id)
+        conversation = self._conversations.get(session_id)
+        if conversation is None:
+            raise KeyError(session_id)
+        async with conversation.lock:
+            if workflow.stage != "agent1":
+                raise WorkflowTransitionError(
+                    "Agent 1 can only be messaged while it is the active step."
+                )
+            user_message = ChatMessage(role="user", content=prompt, status="sending")
+            conversation.messages.append(user_message)
+            workflow.user_input = workflow.user_input or prompt
+            self._statuses[session_id] = "running"
+            self._persist(session_id)
+            task = asyncio.current_task()
+            if task is not None:
+                self._session_tasks[session_id] = task
+            try:
+                reply = await self._send_and_wait(conversation.session, prompt)
+            except AgentUnavailableError:
+                user_message.status = "failed"
+                self._statuses[session_id] = "waiting"
+                self._session_tasks.pop(session_id, None)
+                self._persist(session_id)
+                raise
+            except asyncio.CancelledError:
+                self._session_tasks.pop(session_id, None)
+                raise
+
+            user_message.status = "complete"
+            conversation.messages.append(ChatMessage(role="assistant", content=reply))
+            workflow.error = ""
+            self._statuses[session_id] = "waiting"
+            self._session_tasks.pop(session_id, None)
+            self._persist(session_id)
+
+            try:
+                artifact_path = self._write_artifact(session_id, reply)
+            except OSError:
+                logger.exception("Agent 1 result file could not be written.")
+                workflow.error = (
+                    "Agent 1 replied, but its result file could not be saved. "
+                    "Please try again."
+                )
+                self._persist(session_id)
+                return self.get_workflow(session_id)
+
+            workflow.artifact_path = artifact_path
+            workflow.error = ""
+            workflow.stage = "review"
+            self._statuses[session_id] = "waiting"
+            self._persist(session_id)
+        return self.get_workflow(session_id)
+
     def get_workflow(self, session_id: str) -> dict[str, object]:
         workflow = self._workflows.get(session_id)
         if workflow is None:

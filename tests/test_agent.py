@@ -143,6 +143,33 @@ class AgentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["stage"], "review")
         self.assertEqual(result["artifact_content"], "Reply to: One more thing")
 
+    async def test_submit_for_review_sends_prompt_and_records_answer(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        session_id, _ = await service.open_conversation(None)
+
+        await service.send_message(session_id, "Let's discuss this")
+        workflow = service.get_workflow(session_id)
+
+        self.assertEqual(workflow["stage"], "agent1")
+        self.assertFalse(workflow["artifact_ready"])
+
+        result = await service.submit_for_review(session_id, "Please provide your final answer")
+
+        self.assertEqual(result["stage"], "review")
+        self.assertEqual(result["artifact_content"], "Reply to: Please provide your final answer")
+        self.assertIn("Please provide your final answer", client.session.messages)
+
+    async def test_submit_for_review_cannot_proceed_during_agent_response(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        session_id, _ = await service.open_conversation(None)
+
+        with self.assertRaises(WorkflowTransitionError):
+            await service.submit_for_review(session_id, "Direct submission prompt")
+
     async def test_failed_message_is_marked_and_not_returned_as_reply(self) -> None:
         client = FakeClient()
         service = self.track(CopilotAgentService())

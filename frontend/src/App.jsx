@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { AgentEditor } from "./AgentEditor";
 
 const WORKFLOW_STEPS = ["Agent 1", "Release", "Agent 2"];
 
@@ -40,10 +41,14 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [workflow, setWorkflow] = useState(null);
   const [draft, setDraft] = useState("");
+  const [finalizationPrompt, setFinalizationPrompt] = useState("");
+  const [showFinalizationPrompt, setShowFinalizationPrompt] = useState(false);
   const [loading, setLoading] = useState(false);
   const [starting, setStarting] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState("");
+  const [editingConfigId, setEditingConfigId] = useState(null);
+  const [agentConfigs, setAgentConfigs] = useState([]);
   const endOfMessages = useRef(null);
   const activeSessionRef = useRef(null);
   const sessionIsRunning = sessions.some((saved) => saved.id === sessionId && saved.status === "running");
@@ -54,11 +59,12 @@ export default function App() {
 
   async function refreshLists() {
     try {
-      const [savedAgents, savedSessions] = await Promise.all([
-        request("/api/agents"), request("/api/sessions"),
+      const [savedAgents, savedSessions, configs] = await Promise.all([
+        request("/api/agents"), request("/api/sessions"), request("/api/agent-configs"),
       ]);
       setAgents(savedAgents);
       setSessions(savedSessions);
+      setAgentConfigs(configs);
       setSelectedAgentId((current) => current || savedAgents[0]?.id || "");
     } catch (failure) {
       setAgentError(failure.message);
@@ -104,6 +110,7 @@ export default function App() {
   async function selectSession(saved) {
     activeSessionRef.current = saved.id;
     setSessionId(saved.id);
+    setEditingConfigId(null);
     setMessages(saved.messages || []);
     setWorkflow({
       stage: saved.stage, artifact_ready: false, artifact_content: null,
@@ -238,17 +245,25 @@ export default function App() {
     }
   }
 
-  async function runAction(action) {
+  async function runAction(action, payload = null) {
     if (!sessionId || actionLoading) return;
     setActionLoading(true);
     setError("");
     try {
+      const options = { method: "POST" };
+      if (payload) {
+        options.body = JSON.stringify(payload);
+      }
       const result = await request(
         `/api/sessions/${encodeURIComponent(sessionId)}/${action}`,
-        { method: "POST" },
+        options,
       );
       setWorkflow(result);
       setError(result.error || "");
+      if (action === "finalize") {
+        setShowFinalizationPrompt(false);
+        setFinalizationPrompt("");
+      }
     } catch (failure) {
       setError(failure.message);
     } finally {
@@ -262,7 +277,10 @@ export default function App() {
     setMessages([]);
     setWorkflow(null);
     setDraft("");
+    setFinalizationPrompt("");
+    setShowFinalizationPrompt(false);
     setError("");
+    setEditingConfigId(null);
   }
 
   const stage = workflow?.stage || "agent1";
@@ -322,6 +340,21 @@ export default function App() {
               {agentForm.id && <button type="button" className="discard-button" onClick={() => removeAgent(agentForm)}>Delete agent</button>}
             </form>
           )}
+          <div className="sidebar-section-heading">
+            <span>AGENT CONFIGS</span>
+            <button className="icon-button" aria-label="Create agent config" onClick={() => setEditingConfigId("new")}>+</button>
+          </div>
+          <div className="config-list">
+            {agentConfigs.map((config) => (
+              <button
+                key={config.id}
+                className={`config-row ${editingConfigId === config.id ? "selected" : ""}`}
+                onClick={() => setEditingConfigId(config.id)}
+              >
+                <span className="config-name">{config.name}</span>
+              </button>
+            ))}
+          </div>
           <div className="sidebar-section-heading sessions-heading"><span>SESSIONS</span></div>
           <button className={`new-session-button ${!sessionId ? "selected" : ""}`} onClick={goHome}>＋ <span>New session</span></button>
           <div className="session-list">
@@ -338,7 +371,20 @@ export default function App() {
           {agentError && <p className="alert sidebar-alert" role="alert">{agentError}</p>}
         </aside>
         <section className="work-area" aria-label="Active workflow step">
-          {!sessionId && (
+          {editingConfigId && (
+            <AgentEditor
+              configId={editingConfigId === "new" ? null : editingConfigId}
+              onClose={() => {
+                setEditingConfigId(null);
+                refreshLists();
+              }}
+              onSave={(saved) => {
+                setEditingConfigId(null);
+                refreshLists();
+              }}
+            />
+          )}
+          {!editingConfigId && !sessionId && (
             <section className="new-session-panel">
               <div className="brand-mark" aria-hidden="true">✳</div>
               <p className="eyebrow">COPILOT WORKFLOW</p>
@@ -393,14 +439,50 @@ export default function App() {
               </div>
               {error && <p className="alert inline-alert" role="alert">{error}</p>}
               <div className="conversation-actions">
-                <p>When you are done discussing, use the latest answer as the result.</p>
-                <button
-                  className="secondary-button"
-                  onClick={() => runAction("finalize")}
-                  disabled={actionLoading || sessionProcessing || !canUseLastAnswer}
-                >
-                  {actionLoading ? "Saving result…" : "Use last answer"}
-                </button>
+                {!showFinalizationPrompt ? (
+                  <>
+                    <p>Get a final answer from Agent 1 to review.</p>
+                    <button
+                      className="secondary-button"
+                      onClick={() => setShowFinalizationPrompt(true)}
+                      disabled={actionLoading || sessionProcessing}
+                    >
+                      Request final answer
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <label htmlFor="finalization-prompt">What should Agent 1 provide as the final answer?</label>
+                    <textarea
+                      id="finalization-prompt"
+                      value={finalizationPrompt}
+                      onChange={(event) => setFinalizationPrompt(event.target.value)}
+                      placeholder="Describe what you want Agent 1 to deliver…"
+                      rows="2"
+                      maxLength="20000"
+                      disabled={actionLoading}
+                    />
+                    <div className="prompt-actions">
+                      <button
+                        className="secondary-button"
+                        onClick={() => {
+                          setShowFinalizationPrompt(false);
+                          setFinalizationPrompt("");
+                        }}
+                        disabled={actionLoading}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        className="primary-button"
+                        onClick={() => runAction("finalize", { prompt: finalizationPrompt })}
+                        disabled={actionLoading || !finalizationPrompt.trim()}
+                      >
+                        {actionLoading ? "Requesting answer…" : "Get answer for review"}
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
               <form className="composer" onSubmit={sendMessage}>
                 <label className="visually-hidden" htmlFor="message">Your message</label>

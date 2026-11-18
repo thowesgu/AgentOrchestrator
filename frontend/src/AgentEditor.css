@@ -1,0 +1,157 @@
+.agent-editor {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #fff;
+}
+
+.editor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1.5rem;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.editor-header h2 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  padding: 0.5rem;
+  color: #666;
+}
+
+.close-btn:hover {
+  color: #000;
+}
+
+.editor-form {
+  flex: 1;
+  overflow-y: auto;
+  padding: 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.form-group label {
+  font-weight: 500;
+  color: #333;
+}
+
+.form-group input,
+.form-group textarea {
+  padding: 0.75rem;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 1rem;
+}
+
+.form-group input:disabled,
+.form-group textarea:disabled {
+  background: #f9fafb;
+  color: #9ca3af;
+}
+
+.form-group textarea {
+  resize: vertical;
+}
+
+.error-message {
+  color: #dc2626;
+  padding: 0.75rem 2rem;
+  background: #fee2e2;
+  border-left: 4px solid #dc2626;
+  margin: 0 2rem;
+}
+
+.editor-actions {
+  display: flex;
+  gap: 1rem;
+  justify-content: flex-end;
+  padding: 1.5rem 2rem;
+  border-top: 1px solid #e5e7eb;
+  background: #f9fafb;
+}
+
+.save-btn,
+.cancel-btn {
+  padding: 0.75rem 1.5rem;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font-size: 1rem;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.save-btn {
+  background: #3b82f6;
+  color: white;
+  border-color: #3b82f6;
+}
+
+.save-btn:hover:not(:disabled) {
+  background: #2563eb;
+}
+
+.save-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cancel-btn {
+  background: white;
+  color: #333;
+}
+
+.cancel-btn:hover:not(:disabled) {
+  background: #f3f4f6;
+}
+
+.config-row {
+  display: block;
+  width: 100%;
+  padding: 0.75rem 1rem;
+  border: none;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  color: #666;
+  font-size: 0.875rem;
+  border-left: 3px solid transparent;
+}
+
+.config-row:hover {
+  background: #f3f4f6;
+  color: #000;
+}
+
+.config-row.selected {
+  background: #eff6ff;
+  border-left-color: #3b82f6;
+  color: #1e40af;
+  font-weight: 500;
+}
+
+.config-name {
+  display: block;
+  word-break: break-word;
+}
+
+.config-list {
+  max-height: 200px;
+  overflow-y: auto;
+}
