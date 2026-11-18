@@ -5,13 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-orchestrator"
 version = "0.1.0"
-description = "A headless platform for coordinating specialized development agents."
+description = "A React chat MVP powered by the GitHub Copilot SDK."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "fastapi>=0.115,<1",
+    "microsoft-copilot-sdk>=2,<3",
+    "uvicorn[standard]>=0.34,<1",
+]
 
 [project.optional-dependencies]
-copilot = ["github-copilot-sdk"]
+test = ["httpx>=0.27,<1"]
 
 [project.scripts]
 agent-orchestrator = "agent_orchestrator.cli:main"

@@ -4,5 +4,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+frontend/node_modules/
+frontend/dist/
 runs/
 .pytest_cache/
