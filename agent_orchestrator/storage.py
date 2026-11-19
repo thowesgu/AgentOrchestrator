@@ -46,7 +46,7 @@ class Store:
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent_name TEXT NOT NULL,
-                    input TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+                    workflow_id TEXT, input TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
                     messages TEXT NOT NULL DEFAULT '[]', output TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '', artifact TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -59,6 +59,21 @@ class Store:
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS workflow_configs (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, config TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            self._migrate_sessions_table(connection)
+
+    def _migrate_sessions_table(self, connection: sqlite3.Connection) -> None:
+        """Add workflow_id column if it doesn't exist."""
+        cursor = connection.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "workflow_id" not in columns:
+            connection.execute("ALTER TABLE sessions ADD COLUMN workflow_id TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -115,13 +130,13 @@ class Store:
         with self._connection() as connection:
             connection.execute(
                 """INSERT INTO sessions
-                (id, agent_id, agent_name, input, stage, status, messages, output, error, artifact, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                (id, agent_id, agent_name, workflow_id, input, stage, status, messages, output, error, artifact, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(id) DO UPDATE SET agent_id=excluded.agent_id,
-                  agent_name=excluded.agent_name, input=excluded.input, stage=excluded.stage,
+                  agent_name=excluded.agent_name, workflow_id=excluded.workflow_id, input=excluded.input, stage=excluded.stage,
                   status=excluded.status, messages=excluded.messages, output=excluded.output,
                   error=excluded.error, artifact=excluded.artifact, updated_at=CURRENT_TIMESTAMP""",
-                (value["id"], value["agent_id"], value["agent_name"], value["input"],
+                (value["id"], value["agent_id"], value["agent_name"], value.get("workflow_id"), value["input"],
                  value["stage"], value["status"], json.dumps(value.get("messages", [])),
                  value.get("output", ""), value.get("error", ""), value.get("artifact", "")),
             )
@@ -139,8 +154,13 @@ class Store:
 
     @staticmethod
     def _session(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            workflow_id = row["workflow_id"]
+        except IndexError:
+            workflow_id = None
         return {
             "id": row["id"], "agent_id": row["agent_id"], "agent_name": row["agent_name"],
+            "workflow_id": workflow_id,
             "input": row["input"], "stage": row["stage"], "status": row["status"],
             "messages": json.loads(row["messages"]), "output": row["output"],
             "error": row["error"], "artifact": row["artifact"],
@@ -197,3 +217,41 @@ class Store:
     def delete_agent_config(self, agent_id: str) -> None:
         with self._connection() as connection:
             connection.execute("DELETE FROM agent_configs WHERE id = ?", (agent_id,))
+
+    def save_workflow_config(self, value: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO workflow_configs(id, name, config, updated_at)
+                VALUES(?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name, config=excluded.config,
+                  updated_at=CURRENT_TIMESTAMP""",
+                (value["id"], value["name"], value["config"]),
+            )
+
+    def workflow_config(self, workflow_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_configs WHERE id = ?", (workflow_id,)
+            ).fetchone()
+            return self._workflow_config(row) if row else None
+
+    def workflow_configs(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            return [
+                self._workflow_config(row)
+                for row in connection.execute("SELECT * FROM workflow_configs ORDER BY updated_at DESC")
+            ]
+
+    @staticmethod
+    def _workflow_config(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "config": row["config"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def delete_workflow_config(self, workflow_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute("DELETE FROM workflow_configs WHERE id = ?", (workflow_id,))

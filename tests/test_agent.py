@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -77,8 +78,8 @@ class AgentServiceTests(unittest.IsolatedAsyncioTestCase):
             self.services: list[CopilotAgentService] = []
             self.temporary_directory = tempfile.TemporaryDirectory()
         service.store = Store(Path(self.temporary_directory.name) / "data.sqlite3")
-        service.store.save_agent({
-            "id": "default", "name": "Agent 1", "role": "Role", "tools": [], "permissions": [],
+        service.store.save_agent_config({
+            "id": "default", "name": "Agent 1", "instructions": "Role", "expected_result": "",
         })
         service._artifact_directory = Path(self.temporary_directory.name) / "artifacts"
         service._artifact_directory.mkdir(exist_ok=True)
@@ -95,6 +96,30 @@ class AgentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session_id, resumed_id)
         self.assertEqual(first_history, resumed_history)
         self.assertEqual(first_history[0].role, "assistant")
+
+    async def test_workflow_graph_is_available_for_live_and_restored_sessions(self) -> None:
+        service = self.track(CopilotAgentService())
+        service._client = FakeClient()
+        graph = {
+            "nodes": [
+                {"id": "input", "type": "data_source", "position": {"x": 800, "y": 400}},
+                {"id": "agent", "type": "agent", "position": {"x": 1200, "y": 400}},
+            ],
+            "edges": [{"source": "input", "target": "agent", "data": "request"}],
+        }
+        service.store.save_workflow_config({"id": "workflow-1", "name": "Workflow", "config": json.dumps(graph)})
+        session_id, _ = await service.open_conversation(None, workflow_id="workflow-1")
+
+        result = service.get_workflow(session_id)
+        self.assertEqual(result["nodes"], graph["nodes"])
+        self.assertEqual(result["edges"], graph["edges"])
+        self.assertEqual(service.store.session(session_id)["workflow_id"], "workflow-1")
+
+        restored = CopilotAgentService()
+        restored.store = service.store
+        result = restored.get_workflow(session_id)
+        self.assertEqual(result["nodes"], graph["nodes"])
+        self.assertEqual(result["edges"], graph["edges"])
 
     async def test_unknown_session_starts_new_conversation(self) -> None:
         service = self.track(CopilotAgentService())

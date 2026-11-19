@@ -1,0 +1,53 @@
+.workflow-visualization-container {
+  width: 100%;
+  flex: 1 1 320px;
+  min-height: 320px;
+  background: white;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid #e8e7e1;
+}
+
+.workflow-visualization-empty {
+  display: flex;
+  flex: 1 1 320px;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 320px;
+  color: #9a9e99;
+  font-size: 14px;
+  background: white;
+  border-radius: 12px;
+  border: 1px solid #e8e7e1;
+}
+
+/* ReactFlow customizations */
+.workflow-visualization-container .react-flow__controls {
+  background: rgba(255, 255, 255, 0.9) !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1) !important;
+  border-radius: 8px !important;
+  bottom: 16px !important;
+  left: 16px !important;
+}
+
+.workflow-visualization-container .react-flow__controls-button {
+  background: #f5f4f0 !important;
+  border: 1px solid #e8e7e1 !important;
+  color: #354e43 !important;
+}
+
+.workflow-visualization-container .react-flow__controls-button:hover {
+  background: #e8e6dc !important;
+}
+
+.workflow-visualization-container .react-flow__background {
+  background: linear-gradient(to right, #f9f8f5 1px, transparent 1px),
+    linear-gradient(to bottom, #f9f8f5 1px, transparent 1px) !important;
+  background-size: 50px 50px !important;
+  background-color: #fafaf8 !important;
+}
+
+.workflow-visualization-container .react-flow__edge-path {
+  stroke: #a8b2a7 !important;
+}

@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AgentEditor } from "./AgentEditor";
+import { WorkflowEditor } from "./WorkflowEditor";
+import { WorkflowVisualization } from "./WorkflowVisualization";
 
 const WORKFLOW_STEPS = ["Agent 1", "Release", "Agent 2"];
 
@@ -30,14 +32,11 @@ function stepStatus(stage, index) {
 }
 
 export default function App() {
-  const [agents, setAgents] = useState([]);
   const [sessions, setSessions] = useState([]);
-  const [options, setOptions] = useState({ tools: [], permissions: [] });
-  const [selectedAgentId, setSelectedAgentId] = useState("");
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
   const [sessionPrompt, setSessionPrompt] = useState("");
-  const [agentForm, setAgentForm] = useState(null);
-  const [agentError, setAgentError] = useState("");
   const [sessionId, setSessionId] = useState(null);
+  const [workflowId, setWorkflowId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [workflow, setWorkflow] = useState(null);
   const [draft, setDraft] = useState("");
@@ -49,6 +48,8 @@ export default function App() {
   const [error, setError] = useState("");
   const [editingConfigId, setEditingConfigId] = useState(null);
   const [agentConfigs, setAgentConfigs] = useState([]);
+  const [workflowConfigs, setWorkflowConfigs] = useState([]);
+  const [editingWorkflowId, setEditingWorkflowId] = useState(null);
   const endOfMessages = useRef(null);
   const activeSessionRef = useRef(null);
   const sessionIsRunning = sessions.some((saved) => saved.id === sessionId && saved.status === "running");
@@ -59,20 +60,19 @@ export default function App() {
 
   async function refreshLists() {
     try {
-      const [savedAgents, savedSessions, configs] = await Promise.all([
-        request("/api/agents"), request("/api/sessions"), request("/api/agent-configs"),
+      const [savedSessions, configs, workflows] = await Promise.all([
+        request("/api/sessions"), request("/api/agent-configs"), request("/api/workflow-configs"),
       ]);
-      setAgents(savedAgents);
       setSessions(savedSessions);
       setAgentConfigs(configs);
-      setSelectedAgentId((current) => current || savedAgents[0]?.id || "");
+      setWorkflowConfigs(workflows);
+      setSelectedWorkflowId((current) => current || workflows[0]?.id || "");
     } catch (failure) {
-      setAgentError(failure.message);
+      setError(failure.message);
     }
   }
 
   useEffect(() => {
-    request("/api/options").then(setOptions).catch((failure) => setAgentError(failure.message));
     refreshLists();
     const timer = setInterval(refreshLists, 1200);
     return () => clearInterval(timer);
@@ -112,6 +112,10 @@ export default function App() {
     setSessionId(saved.id);
     setEditingConfigId(null);
     setMessages(saved.messages || []);
+    const config = agentConfigs.find(c => c.id === saved.agent_id);
+    if (config?.expected_result) {
+      setFinalizationPrompt(config.expected_result);
+    }
     setWorkflow({
       stage: saved.stage, artifact_ready: false, artifact_content: null,
       output: saved.output || "", error: saved.error || "",
@@ -136,67 +140,27 @@ export default function App() {
     }
   }
 
-  async function saveAgent(event) {
-    event.preventDefault();
-    setAgentError("");
-    const editing = agentForm?.id;
-    try {
-      const result = await request(editing ? `/api/agents/${encodeURIComponent(editing)}` : "/api/agents", {
-        method: editing ? "PUT" : "POST",
-        body: JSON.stringify({
-          name: agentForm.name, role: agentForm.role,
-          tools: agentForm.tools, permissions: agentForm.permissions,
-        }),
-      });
-      setAgentForm(null);
-      setSelectedAgentId(result.id);
-      await refreshLists();
-    } catch (failure) {
-      setAgentError(failure.message);
-    }
-  }
-
-  async function removeAgent(agent) {
-    try {
-      await request(`/api/agents/${encodeURIComponent(agent.id)}`, { method: "DELETE" });
-      if (selectedAgentId === agent.id) setSelectedAgentId("");
-      await refreshLists();
-    } catch (failure) {
-      setAgentError(failure.message);
-    }
-  }
-
   async function startChat(event) {
     event?.preventDefault();
     const content = sessionPrompt.trim();
-    if (!content || !selectedAgentId) return;
+    if (!content || !selectedWorkflowId) return;
     setStarting(true);
     setError("");
     let createdSessionId = null;
     try {
       const result = await request("/api/sessions", {
         method: "POST",
-        body: JSON.stringify({ agent_id: selectedAgentId }),
+        body: JSON.stringify({ config_id: "75fd9b5a-b982-441c-8349-6194865463c8", prompt: content, workflow_id: selectedWorkflowId }),
       });
       createdSessionId = result.session_id;
       activeSessionRef.current = result.session_id;
       setSessionId(result.session_id);
+      setWorkflowId(selectedWorkflowId);
       setMessages(result.messages);
       setWorkflow(result.workflow);
       setSessionPrompt("");
-      setLoading(true);
-      setMessages([{ role: "user", content, status: "sending" }]);
+      setLoading(false);
       void refreshLists();
-      const reply = await request(
-        `/api/sessions/${encodeURIComponent(result.session_id)}/messages`,
-        { method: "POST", body: JSON.stringify({ content }) },
-      );
-      if (activeSessionRef.current === result.session_id) {
-        setMessages(reply.messages);
-        setWorkflow(reply.workflow);
-        setError(reply.workflow.error || "");
-      }
-      await refreshLists();
     } catch (failure) {
       if (createdSessionId && activeSessionRef.current === createdSessionId) {
         setError(failure.message);
@@ -274,6 +238,7 @@ export default function App() {
   function goHome() {
     activeSessionRef.current = null;
     setSessionId(null);
+    setWorkflowId(null);
     setMessages([]);
     setWorkflow(null);
     setDraft("");
@@ -317,30 +282,6 @@ export default function App() {
             <strong>Orchestrator</strong>
           </div>
           <div className="sidebar-section-heading">
-            <span>AGENTS</span>
-            <button className="icon-button" aria-label="Create agent" onClick={() => setAgentForm({ name: "", role: "", tools: [], permissions: [] })}>+</button>
-          </div>
-          <div className="agent-list">
-            {agents.map((agent) => (
-              <div className={`agent-row ${selectedAgentId === agent.id ? "selected" : ""}`} key={agent.id}>
-                <button className="agent-select" onClick={() => { setSelectedAgentId(agent.id); goHome(); }}>
-                  <span className="agent-avatar">✳</span><span>{agent.name}</span>
-                </button>
-                <button className="icon-button subtle" aria-label={`Edit ${agent.name}`} onClick={() => setAgentForm({ ...agent })}>⋯</button>
-              </div>
-            ))}
-          </div>
-          {agentForm && (
-            <form className="agent-editor" onSubmit={saveAgent}>
-              <label>Agent name<input required maxLength="100" value={agentForm.name} onChange={(event) => setAgentForm({ ...agentForm, name: event.target.value })} /></label>
-              <label>Role description<textarea required rows="3" value={agentForm.role} onChange={(event) => setAgentForm({ ...agentForm, role: event.target.value })} /></label>
-              <fieldset><legend>Allowed tools</legend>{options.tools.map((item) => <label className="option-row" key={item}><input type="checkbox" checked={agentForm.tools.includes(item)} onChange={(event) => setAgentForm({ ...agentForm, tools: event.target.checked ? [...agentForm.tools, item] : agentForm.tools.filter((value) => value !== item) })} />{item}</label>)}</fieldset>
-              <fieldset><legend>Permissions</legend>{options.permissions.map((item) => <label className="option-row" key={item}><input type="checkbox" checked={agentForm.permissions.includes(item)} onChange={(event) => setAgentForm({ ...agentForm, permissions: event.target.checked ? [...agentForm.permissions, item] : agentForm.permissions.filter((value) => value !== item) })} />{item}</label>)}</fieldset>
-              <div className="editor-actions"><button type="button" className="secondary-button" onClick={() => setAgentForm(null)}>Cancel</button><button type="submit" className="primary-button">Save</button></div>
-              {agentForm.id && <button type="button" className="discard-button" onClick={() => removeAgent(agentForm)}>Delete agent</button>}
-            </form>
-          )}
-          <div className="sidebar-section-heading">
             <span>AGENT CONFIGS</span>
             <button className="icon-button" aria-label="Create agent config" onClick={() => setEditingConfigId("new")}>+</button>
           </div>
@@ -350,6 +291,21 @@ export default function App() {
                 key={config.id}
                 className={`config-row ${editingConfigId === config.id ? "selected" : ""}`}
                 onClick={() => setEditingConfigId(config.id)}
+              >
+                <span className="config-name">{config.name}</span>
+              </button>
+            ))}
+          </div>
+          <div className="sidebar-section-heading">
+            <span>WORKFLOW CONFIGS</span>
+            <button className="icon-button" aria-label="Create workflow config" onClick={() => setEditingWorkflowId("new")}>+</button>
+          </div>
+          <div className="config-list">
+            {workflowConfigs.map((config) => (
+              <button
+                key={config.id}
+                className={`config-row ${editingWorkflowId === config.id ? "selected" : ""}`}
+                onClick={() => setEditingWorkflowId(config.id)}
               >
                 <span className="config-name">{config.name}</span>
               </button>
@@ -368,7 +324,6 @@ export default function App() {
               </div>
             ))}
           </div>
-          {agentError && <p className="alert sidebar-alert" role="alert">{agentError}</p>}
         </aside>
         <section className="work-area" aria-label="Active workflow step">
           {editingConfigId && (
@@ -384,21 +339,35 @@ export default function App() {
               }}
             />
           )}
+          {editingWorkflowId && (
+            <WorkflowEditor
+              key={editingWorkflowId}
+              configId={editingWorkflowId === "new" ? null : editingWorkflowId}
+              onClose={() => {
+                setEditingWorkflowId(null);
+                refreshLists();
+              }}
+              onSave={(saved) => {
+                setEditingWorkflowId(null);
+                refreshLists();
+              }}
+            />
+          )}
           {!editingConfigId && !sessionId && (
             <section className="new-session-panel">
               <div className="brand-mark" aria-hidden="true">✳</div>
               <p className="eyebrow">COPILOT WORKFLOW</p>
               <h1>A little help<br />goes a long way.</h1>
-              <p className="intro">Choose an agent and tell it what you would like to work on.</p>
+              <p className="intro">Choose a workflow and tell it what you would like to work on.</p>
               {error && <p className="alert" role="alert">{error}</p>}
               <form className="new-session-form" onSubmit={startChat}>
-                <label htmlFor="agent-picker">Selected agent</label>
-                <select id="agent-picker" value={selectedAgentId} onChange={(event) => setSelectedAgentId(event.target.value)} required>
-                  {agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}
+                <label htmlFor="workflow-picker">Selected workflow</label>
+                <select id="workflow-picker" value={selectedWorkflowId} onChange={(event) => setSelectedWorkflowId(event.target.value)} required>
+                  {workflowConfigs.map((config) => <option value={config.id} key={config.id}>{config.name}</option>)}
                 </select>
                 <label htmlFor="session-prompt">Your request</label>
-                <textarea id="session-prompt" value={sessionPrompt} onChange={(event) => setSessionPrompt(event.target.value)} maxLength="20000" rows="5" placeholder="Describe what you would like the agent to do…" required />
-                <button className="primary-button" type="submit" disabled={starting || !sessionPrompt.trim() || !selectedAgentId}>
+                <textarea id="session-prompt" value={sessionPrompt} onChange={(event) => setSessionPrompt(event.target.value)} maxLength="20000" rows="5" placeholder="Describe what you would like the workflow to do…" required />
+                <button className="primary-button" type="submit" disabled={starting || !sessionPrompt.trim() || !selectedWorkflowId}>
                   {starting ? "Starting session…" : "Start session"} {!starting && <span aria-hidden="true">↗</span>}
                 </button>
               </form>
@@ -452,23 +421,14 @@ export default function App() {
                   </>
                 ) : (
                   <>
-                    <label htmlFor="finalization-prompt">What should Agent 1 provide as the final answer?</label>
-                    <textarea
-                      id="finalization-prompt"
-                      value={finalizationPrompt}
-                      onChange={(event) => setFinalizationPrompt(event.target.value)}
-                      placeholder="Describe what you want Agent 1 to deliver…"
-                      rows="2"
-                      maxLength="20000"
-                      disabled={actionLoading}
-                    />
+                    <div className="finalization-container">
+                      <label>Expected result:</label>
+                      <p className="finalization-preview">{finalizationPrompt || "No expected result defined"}</p>
+                    </div>
                     <div className="prompt-actions">
                       <button
                         className="secondary-button"
-                        onClick={() => {
-                          setShowFinalizationPrompt(false);
-                          setFinalizationPrompt("");
-                        }}
+                        onClick={() => setShowFinalizationPrompt(false)}
                         disabled={actionLoading}
                       >
                         Cancel
@@ -599,27 +559,21 @@ export default function App() {
           </>}
         </section>
 
-        <aside className="workflow-sidebar" aria-label="Workflow progress">
-          <p className="eyebrow">WORKFLOW</p>
-          <h2>Your progress</h2>
-          <ol className="step-list">
-            {WORKFLOW_STEPS.map((label, index) => {
-              const status = stepStatus(stage, index);
-              return (
-                <li className={`workflow-step ${status === "active" ? "is-active" : ""} ${status === "done" ? "is-done" : ""} ${status === "failed" || status === "discarded" ? "is-ended" : ""}`} key={label}>
-                  <span className="step-indicator" aria-hidden="true">
-                    {status === "done" ? "✓" : status === "discarded" ? "×" : index + 1}
-                  </span>
-                  <span className="step-copy">
-                    <strong>{label}</strong>
-                    <span>{status === "active" && stage === "review" ? "Waiting for your decision" : status === "active" && stage === "agent2" ? "Processing approved file" : status === "active" ? "In progress" : status}</span>
-                  </span>
-                </li>
-              );
-            })}
-          </ol>
-          {stage === "complete" && (
-            <button className="sidebar-home" onClick={goHome}>Start a new workflow <span aria-hidden="true">↗</span></button>
+        <aside className={`workflow-sidebar${sessionId ? " has-session" : ""}`} aria-label="Workflow progress">
+          {sessionId ? (
+            <>
+              <p className="eyebrow">WORKFLOW</p>
+              <h2>Workflow Visualization</h2>
+              <WorkflowVisualization workflow={workflow} />
+            </>
+          ) : (
+            <div className="workflow-sidebar-empty">
+              <p className="eyebrow">WORKFLOW</p>
+              <h2>Your progress</h2>
+              <p style={{ color: "#9a9e99", fontSize: "14px", marginTop: "16px" }}>
+                Select or start a session to see the workflow visualization.
+              </p>
+            </div>
           )}
         </aside>
       </div>

@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from fastapi.testclient import TestClient
@@ -9,12 +10,19 @@ from agent_orchestrator.agent import WorkflowTransitionError
 
 class FakeStore:
     def __init__(self) -> None:
-        self.agents = {
-            "default": {"id": "default", "name": "Agent 1", "role": "Role", "tools": [], "permissions": []}
+        self.agent_configs = {
+            "default": {"id": "default", "name": "Agent 1", "instructions": "Role", "expected_result": ""}
         }
+        self.saved_workflow_configs = {}
 
-    def agent(self, agent_id: str) -> object | None:
-        return self.agents.get(agent_id)
+    def agent_config(self, config_id: str) -> object | None:
+        return self.agent_configs.get(config_id)
+
+    def save_workflow_config(self, value: dict[str, object]) -> None:
+        self.saved_workflow_configs[value["id"]] = value
+
+    def workflow_config(self, config_id: str) -> object | None:
+        return self.saved_workflow_configs.get(config_id)
 
 
 class FakeAgent:
@@ -30,24 +38,24 @@ class FakeAgent:
         return None
 
     async def open_conversation(
-        self, session_id: str | None, agent_id: str = "default"
+        self, session_id: str | None, config_id: str = "default"
     ) -> tuple[str, list[ChatMessage]]:
         return session_id or "new-session", [ChatMessage("assistant", "Hello.")]
 
-    def list_agents(self) -> list[dict[str, object]]:
-        return list(self.store.agents.values())
+    def list_agent_configs(self) -> list[dict[str, object]]:
+        return list(self.store.agent_configs.values())
 
-    def save_agent(self, value: dict[str, object], agent_id: str | None = None) -> dict[str, object]:
-        saved = {"id": agent_id or "created-agent", **value}
-        self.store.agents[saved["id"]] = saved
+    def save_agent_config(self, value: dict[str, object], config_id: str | None = None) -> dict[str, object]:
+        saved = {"id": config_id or "created-config", **value}
+        self.store.agent_configs[saved["id"]] = saved
         return saved
 
-    def delete_agent(self, agent_id: str) -> None:
-        if agent_id not in self.store.agents:
-            raise KeyError(agent_id)
-        if any(session["agent_id"] == agent_id and session["status"] != "completed" for session in self.saved_sessions.values()):
+    def delete_agent_config(self, config_id: str) -> None:
+        if config_id not in self.store.agent_configs:
+            raise KeyError(config_id)
+        if any(session["agent_id"] == config_id and session["status"] != "completed" for session in self.saved_sessions.values()):
             raise WorkflowTransitionError("Active sessions exist.")
-        del self.store.agents[agent_id]
+        del self.store.agent_configs[config_id]
 
     def list_sessions(self) -> list[dict[str, object]]:
         return list(self.saved_sessions.values())
@@ -126,6 +134,20 @@ class WebApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_workflow_config_accepts_json_objects_and_legacy_strings(self) -> None:
+        graph = {"nodes": [{"id": "a", "type": "agent"}], "edges": []}
+        created = self.client.post("/api/workflow-configs", json={"name": "Graph", "config": graph})
+        self.assertEqual(created.status_code, 200)
+        saved = created.json()
+        self.assertEqual(json.loads(saved["config"]), graph)
+        updated = self.client.put(
+            f"/api/workflow-configs/{saved['id']}", json={"name": "Graph", "config": '{"nodes":[],"edges":[]}'}
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(json.loads(updated.json()["config"]), {"nodes": [], "edges": []})
+        oversized = self.client.post("/api/workflow-configs", json={"name": "Graph", "config": {"data": "x" * 100_000}})
+        self.assertEqual(oversized.status_code, 422)
+
     def test_unknown_session_is_not_reported_as_success(self) -> None:
         response = self.client.post(
             "/api/sessions/expired/messages", json={"content": "Hello"}
@@ -148,24 +170,6 @@ class WebApiTests(unittest.TestCase):
         approved = self.client.post(f"/api/sessions/{session_id}/approve")
         self.assertEqual(approved.status_code, 200)
         self.assertEqual(approved.json()["stage"], "agent2")
-
-    def test_agent_options_and_configuration_are_available(self) -> None:
-        options = self.client.get("/api/options").json()
-        self.assertEqual(len(options["tools"]), 5)
-        self.assertEqual(len(options["permissions"]), 5)
-        agent = self.client.post("/api/agents", json={
-            "name": "Researcher", "role": "Research carefully",
-            "tools": [options["tools"][0]], "permissions": [options["permissions"][0]],
-        })
-        self.assertEqual(agent.status_code, 200)
-        self.assertEqual(agent.json()["role"], "Research carefully")
-
-    def test_agent_cannot_be_deleted_while_session_is_active(self) -> None:
-        self.agent.saved_sessions["active"] = {
-            "id": "active", "agent_id": "default", "status": "waiting",
-        }
-        response = self.client.delete("/api/agents/default")
-        self.assertEqual(response.status_code, 409)
 
     @property
     def agent(self) -> FakeAgent:

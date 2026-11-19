@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -13,7 +14,6 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
-from agent_orchestrator.storage import PERMISSIONS, TOOLS
 from agent_orchestrator.agent import (
     AgentUnavailableError,
     CopilotAgentService,
@@ -25,27 +25,9 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 class StartSessionRequest(BaseModel):
     session_id: str | None = None
-    agent_id: str = "default"
+    config_id: str = "default"
+    workflow_id: str | None = None
     prompt: Annotated[str, Field(default="", max_length=20_000)]
-
-
-class AgentRequest(BaseModel):
-    name: Annotated[str, Field(min_length=1, max_length=100)]
-    role: Annotated[str, Field(min_length=1, max_length=10_000)]
-    tools: list[str] = Field(default_factory=list)
-    permissions: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def validate_options(self) -> "AgentRequest":
-        if any(option not in TOOLS for option in self.tools):
-            raise ValueError("Unknown tool option.")
-        if any(option not in PERMISSIONS for option in self.permissions):
-            raise ValueError("Unknown permission option.")
-        self.name = self.name.strip()
-        self.role = self.role.strip()
-        if not self.name or not self.role:
-            raise ValueError("Name and role are required.")
-        return self
 
 
 class SendMessageRequest(BaseModel):
@@ -70,6 +52,24 @@ class AgentConfigRequest(BaseModel):
         return self
 
 
+class WorkflowConfigRequest(BaseModel):
+    name: Annotated[str, Field(min_length=1, max_length=200)]
+    config: str | dict[str, object]
+
+    @model_validator(mode="after")
+    def validate(self) -> "WorkflowConfigRequest":
+        self.name = self.name.strip()
+        if isinstance(self.config, dict):
+            self.config = json.dumps(self.config, ensure_ascii=False)
+        else:
+            self.config = self.config.strip()
+        if not self.name or not self.config:
+            raise ValueError("Name and config are required.")
+        if len(self.config) > 100_000:
+            raise ValueError("Config must not exceed 100000 characters.")
+        return self
+
+
 def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
     service = agent or CopilotAgentService()
 
@@ -88,34 +88,6 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @application.get("/api/options")
-    async def get_options() -> dict[str, list[str]]:
-        return {"tools": list(TOOLS), "permissions": list(PERMISSIONS)}
-
-    @application.get("/api/agents")
-    async def list_agents() -> list[dict[str, object]]:
-        return service.list_agents()
-
-    @application.post("/api/agents")
-    async def create_agent(request: AgentRequest) -> dict[str, object]:
-        return service.save_agent(request.model_dump())
-
-    @application.put("/api/agents/{agent_id}")
-    async def update_agent(agent_id: str, request: AgentRequest) -> dict[str, object]:
-        if not service.store.agent(agent_id):
-            raise HTTPException(status_code=404, detail="Agent not found.")
-        return service.save_agent(request.model_dump(), agent_id)
-
-    @application.delete("/api/agents/{agent_id}")
-    async def delete_agent(agent_id: str) -> dict[str, str]:
-        try:
-            service.delete_agent(agent_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="Agent not found.") from error
-        except WorkflowTransitionError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        return {"status": "deleted"}
-
     @application.get("/api/sessions")
     async def list_sessions() -> list[dict[str, object]]:
         return service.list_sessions()
@@ -132,7 +104,7 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
     async def start_session(request: StartSessionRequest) -> dict[str, object]:
         try:
             session_id, messages = await service.open_conversation(
-                request.session_id, request.agent_id
+                request.session_id, request.config_id, request.workflow_id
             )
         except AgentUnavailableError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
@@ -267,6 +239,43 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
     @application.delete("/api/agent-configs/{config_id}")
     async def delete_agent_config(config_id: str) -> dict[str, str]:
         service.store.delete_agent_config(config_id)
+        return {"status": "deleted"}
+
+    @application.get("/api/workflow-configs")
+    async def list_workflow_configs() -> list[dict[str, object]]:
+        return service.store.workflow_configs()
+
+    @application.post("/api/workflow-configs")
+    async def create_workflow_config(request: WorkflowConfigRequest) -> dict[str, object]:
+        config_id = str(uuid.uuid4())
+        service.store.save_workflow_config({
+            "id": config_id,
+            "name": request.name,
+            "config": request.config,
+        })
+        return service.store.workflow_config(config_id)
+
+    @application.put("/api/workflow-configs/{config_id}")
+    async def update_workflow_config(config_id: str, request: WorkflowConfigRequest) -> dict[str, object]:
+        if not service.store.workflow_config(config_id):
+            raise HTTPException(status_code=404, detail="Workflow config not found.")
+        service.store.save_workflow_config({
+            "id": config_id,
+            "name": request.name,
+            "config": request.config,
+        })
+        return service.store.workflow_config(config_id)
+
+    @application.get("/api/workflow-configs/{config_id}")
+    async def get_workflow_config(config_id: str) -> dict[str, object]:
+        config = service.store.workflow_config(config_id)
+        if not config:
+            raise HTTPException(status_code=404, detail="Workflow config not found.")
+        return config
+
+    @application.delete("/api/workflow-configs/{config_id}")
+    async def delete_workflow_config(config_id: str) -> dict[str, str]:
+        service.store.delete_workflow_config(config_id)
         return {"status": "deleted"}
 
     if FRONTEND_DIR.is_dir():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -57,6 +58,7 @@ class Workflow:
     approval_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     agent_id: str = ""
     agent_name: str = ""
+    workflow_id: str | None = None
     user_input: str = ""
 
 
@@ -76,10 +78,10 @@ class CopilotAgentService:
         self._session_tasks: dict[str, asyncio.Task[Any]] = {}
         self._workflow_tasks: dict[str, asyncio.Task[None]] = {}
         self._statuses: dict[str, str] = {}
-        if not self.store.agents():
-            self.store.save_agent({
-                "id": "default", "name": "Agent 1", "role": AGENT_DESCRIPTION,
-                "tools": [], "permissions": [],
+        if not self.store.agent_configs():
+            self.store.save_agent_config({
+                "id": "default", "name": "Default Agent", "instructions": AGENT_DESCRIPTION,
+                "expected_result": "",
             })
 
     async def start(self) -> None:
@@ -102,7 +104,7 @@ class CopilotAgentService:
             self._client = None
 
     async def open_conversation(
-        self, session_id: str | None, agent_id: str = "default"
+        self, session_id: str | None, config_id: str = "default", workflow_id: str | None = None
     ) -> tuple[str, list[ChatMessage]]:
         if session_id and session_id in self._workflows:
             workflow = self._workflows[session_id]
@@ -113,18 +115,18 @@ class CopilotAgentService:
                 return session_id, list(conversation.messages)
             raise WorkflowTransitionError("This conversation is no longer available.")
 
-        definition = self.store.agent(agent_id)
+        definition = self.store.agent_config(config_id)
         if definition is None:
-            raise KeyError(agent_id)
-        session = await self._create_session(definition["role"])
+            raise KeyError(config_id)
+        session = await self._create_session(definition["instructions"])
         new_session_id = session.session_id
-        messages = [ChatMessage(role="assistant", content=definition["role"])]
+        messages = [ChatMessage(role="assistant", content=definition["instructions"])]
         self._conversations[new_session_id] = Conversation(
             session=session, messages=messages
         )
         self._workflows[new_session_id] = Workflow(
-            session_id=new_session_id, agent_id=agent_id,
-            agent_name=definition["name"],
+            session_id=new_session_id, agent_id=config_id,
+            agent_name=definition["name"], workflow_id=workflow_id,
         )
         self._statuses[new_session_id] = "waiting"
         self._persist(new_session_id)
@@ -271,11 +273,23 @@ class CopilotAgentService:
             saved = self.store.session(session_id)
             if saved is None:
                 raise KeyError(session_id)
-            return {
+            result = {
                 "stage": saved["stage"], "artifact_name": "agent-1-result.md" if saved["artifact"] else None,
                 "artifact_content": saved["artifact"] or None, "artifact_ready": bool(saved["artifact"]),
                 "output": saved["output"], "error": saved["error"],
             }
+            # Add workflow visualization data if workflow_id is available
+            if saved.get("workflow_id"):
+                workflow_config = self.store.workflow_config(saved["workflow_id"])
+                if workflow_config:
+                    try:
+                        config_data = json.loads(workflow_config["config"])
+                        if "nodes" in config_data and "edges" in config_data:
+                            result["nodes"] = config_data["nodes"]
+                            result["edges"] = config_data["edges"]
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+            return result
 
         artifact_content: str | None = None
         artifact_ready = False
@@ -296,6 +310,19 @@ class CopilotAgentService:
             "output": workflow.output,
             "error": workflow.error,
         }
+        
+        # Add workflow visualization data if workflow_id is available
+        if workflow.workflow_id:
+            workflow_config = self.store.workflow_config(workflow.workflow_id)
+            if workflow_config:
+                try:
+                    config_data = json.loads(workflow_config["config"])
+                    if "nodes" in config_data and "edges" in config_data:
+                        result["nodes"] = config_data["nodes"]
+                        result["edges"] = config_data["edges"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        
         self._persist(session_id)
         return result
 
@@ -538,6 +565,7 @@ class CopilotAgentService:
             "id": session_id,
             "agent_id": workflow.agent_id,
             "agent_name": workflow.agent_name,
+            "workflow_id": workflow.workflow_id,
             "input": workflow.user_input,
             "stage": workflow.stage,
             "status": self._statuses.get(session_id, "waiting"),
@@ -551,27 +579,26 @@ class CopilotAgentService:
         })
 
     def list_agents(self) -> list[dict[str, Any]]:
-        return self.store.agents()
+        return self.store.agent_configs()
 
     def save_agent(self, value: dict[str, Any], agent_id: str | None = None) -> dict[str, Any]:
         saved = {
             "id": agent_id or uuid.uuid4().hex,
-            "name": value["name"],
-            "role": value["role"],
-            "tools": value["tools"],
-            "permissions": value["permissions"],
+            "name": value.get("name", ""),
+            "instructions": value.get("instructions") or value.get("role", ""),
+            "expected_result": value.get("expected_result", ""),
         }
-        self.store.save_agent(saved)
+        self.store.save_agent_config(saved)
         return saved
 
     def delete_agent(self, agent_id: str) -> None:
-        if self.store.agent(agent_id) is None:
+        if self.store.agent_config(agent_id) is None:
             raise KeyError(agent_id)
         if self.store.has_nonterminal_sessions(agent_id):
             raise WorkflowTransitionError(
                 "This agent cannot be deleted while one of its sessions is active."
             )
-        self.store.delete_agent(agent_id)
+        self.store.delete_agent_config(agent_id)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         return self.store.sessions()
