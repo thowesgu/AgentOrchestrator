@@ -17,6 +17,10 @@ TOOLS = (
     "Terminalbefehle ausführen",
     "Code durchsuchen",
 )
+MAX_CONSTANT_FILE_BYTES = 1_048_576
+SUPPORTED_CONSTANT_FILE_EXTENSIONS = frozenset(
+    {".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".xml", ".log"}
+)
 PERMISSIONS = (
     "Netzwerkzugriff",
     "Lesezugriff auf Dateien",
@@ -66,6 +70,14 @@ class Store:
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS workflow_constant_files (
+                    id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, filename TEXT NOT NULL,
+                    content TEXT NOT NULL, byte_size INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
             self._migrate_sessions_table(connection)
 
     def _migrate_sessions_table(self, connection: sqlite3.Connection) -> None:
@@ -74,6 +86,10 @@ class Store:
         columns = {row[1] for row in cursor.fetchall()}
         if "workflow_id" not in columns:
             connection.execute("ALTER TABLE sessions ADD COLUMN workflow_id TEXT")
+        if "constant_files" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN constant_files TEXT NOT NULL DEFAULT '[]'"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -130,15 +146,17 @@ class Store:
         with self._connection() as connection:
             connection.execute(
                 """INSERT INTO sessions
-                (id, agent_id, agent_name, workflow_id, input, stage, status, messages, output, error, artifact, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                (id, agent_id, agent_name, workflow_id, input, stage, status, messages, output, error, artifact, constant_files, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(id) DO UPDATE SET agent_id=excluded.agent_id,
                   agent_name=excluded.agent_name, workflow_id=excluded.workflow_id, input=excluded.input, stage=excluded.stage,
                   status=excluded.status, messages=excluded.messages, output=excluded.output,
-                  error=excluded.error, artifact=excluded.artifact, updated_at=CURRENT_TIMESTAMP""",
+                  error=excluded.error, artifact=excluded.artifact, constant_files=excluded.constant_files,
+                  updated_at=CURRENT_TIMESTAMP""",
                 (value["id"], value["agent_id"], value["agent_name"], value.get("workflow_id"), value["input"],
                  value["stage"], value["status"], json.dumps(value.get("messages", [])),
-                 value.get("output", ""), value.get("error", ""), value.get("artifact", "")),
+                 value.get("output", ""), value.get("error", ""), value.get("artifact", ""),
+                 json.dumps(value.get("constant_files", []))),
             )
 
     def sessions(self) -> list[dict[str, Any]]:
@@ -164,6 +182,7 @@ class Store:
             "input": row["input"], "stage": row["stage"], "status": row["status"],
             "messages": json.loads(row["messages"]), "output": row["output"],
             "error": row["error"], "artifact": row["artifact"],
+            "constant_files": json.loads(row["constant_files"]),
             "updated_at": row["updated_at"],
         }
 
@@ -254,4 +273,89 @@ class Store:
 
     def delete_workflow_config(self, workflow_id: str) -> None:
         with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM workflow_constant_files WHERE workflow_id = ?", (workflow_id,)
+            )
             connection.execute("DELETE FROM workflow_configs WHERE id = ?", (workflow_id,))
+
+    def save_constant_file(self, value: dict[str, Any]) -> None:
+        content = value["content"]
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO workflow_constant_files
+                (id, workflow_id, filename, content, byte_size, updated_at)
+                VALUES(?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET filename=excluded.filename,
+                  content=excluded.content, byte_size=excluded.byte_size,
+                  updated_at=CURRENT_TIMESTAMP""",
+                (value["id"], value["workflow_id"], value["filename"], content,
+                 len(content.encode("utf-8"))),
+            )
+
+    def constant_file(self, workflow_id: str, file_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT * FROM workflow_constant_files
+                WHERE workflow_id = ? AND id = ?""",
+                (workflow_id, file_id),
+            ).fetchone()
+            return self._constant_file(row) if row else None
+
+    def constant_files(self, workflow_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            return [
+                self._constant_file(row, include_content=False)
+                for row in connection.execute(
+                    """SELECT * FROM workflow_constant_files
+                    WHERE workflow_id = ? ORDER BY created_at, rowid""",
+                    (workflow_id,),
+                )
+            ]
+
+    @staticmethod
+    def _constant_file(row: sqlite3.Row, include_content: bool = True) -> dict[str, Any]:
+        value = {
+            "id": row["id"],
+            "workflow_id": row["workflow_id"],
+            "filename": row["filename"],
+            "byte_size": row["byte_size"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        if include_content:
+            value["content"] = row["content"]
+        return value
+
+    def delete_constant_file(self, workflow_id: str, file_id: str) -> bool:
+        with self._connection() as connection:
+            file_row = connection.execute(
+                """SELECT id, filename FROM workflow_constant_files
+                WHERE workflow_id = ? AND id = ?""",
+                (workflow_id, file_id),
+            ).fetchone()
+            if file_row is None:
+                return False
+
+            workflow_row = connection.execute(
+                "SELECT config FROM workflow_configs WHERE id = ?", (workflow_id,)
+            ).fetchone()
+            if workflow_row is not None:
+                config = json.loads(workflow_row["config"])
+                if isinstance(config, dict) and isinstance(config.get("nodes"), list):
+                    for node in config["nodes"]:
+                        if isinstance(node, dict) and node.get("file_id") == file_id:
+                            node.pop("file_id", None)
+                            node["source_type"] = "manual"
+                            if node.get("label") == file_row["filename"]:
+                                node["label"] = "Data source"
+                    connection.execute(
+                        """UPDATE workflow_configs SET config = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?""",
+                        (json.dumps(config, ensure_ascii=False), workflow_id),
+                    )
+
+            connection.execute(
+                "DELETE FROM workflow_constant_files WHERE workflow_id = ? AND id = ?",
+                (workflow_id, file_id),
+            )
+            return True

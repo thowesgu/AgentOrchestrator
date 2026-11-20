@@ -164,7 +164,7 @@ button:disabled { cursor: wait; opacity: .7; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 .workflow-sidebar { display: flex; flex-direction: column; align-self: start; margin-top: 54px; padding: 23px 20px; border: 1px solid #e8e7e1; border-radius: 16px; background: rgba(255,255,255,.62); min-height: 400px; overflow-y: auto; }
-.workflow-sidebar.has-session { align-self: stretch; margin-bottom: 18px; }
+.workflow-sidebar.has-session { align-self: stretch; margin-right: 20px; margin-bottom: 30px; }
 .workflow-sidebar > .eyebrow { margin: 0 0 8px; }
 .workflow-sidebar h2 { margin: 0 0 16px; font-size: 19px; font-weight: 600; letter-spacing: -.025em; }
 .workflow-sidebar-empty { display: flex; flex-direction: column; }
@@ -229,7 +229,7 @@ button:disabled { cursor: wait; opacity: .7; }
   .workflow-layout { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .agents-sidebar { order: 0; max-height: 40vh; border-right: 0; border-bottom: 1px solid #e8e7e1; }
   .workflow-sidebar { order: 2; margin: 0 16px 18px; padding: 16px; }
-  .workflow-sidebar.has-session { align-self: start; }
+  .workflow-sidebar.has-session { align-self: start; margin-right: 16px; }
   .work-area { min-height: 60vh; padding: 0 16px; }
   .step-list { grid-template-columns: repeat(3, 1fr); margin-top: 16px; }
   .step-list::before { top: 15px; right: 15%; bottom: auto; left: 15%; width: auto; height: 1px; }

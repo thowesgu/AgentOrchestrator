@@ -4,35 +4,67 @@ import "reactflow/dist/style.css";
 import { configFromGraph, graphFromConfig, NODE_TYPES, nodeStyle } from "./workflowGraph";
 import "./WorkflowEditor.css";
 
+const MAX_FILE_BYTES = 1_048_576;
+const FILE_ACCEPT = ".txt,.md,.csv,.json,.yaml,.yml,.xml,.log";
+
+async function readResponse(response) {
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = payload.detail;
+    throw new Error(typeof detail === "string" ? detail : "The request failed. Check the file and try again.");
+  }
+  return payload;
+}
+
+async function encodeFile(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 32_768) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 32_768));
+  }
+  return btoa(binary);
+}
+
 export function WorkflowEditor({ configId, onClose, onSave }) {
+  const [savedConfigId, setSavedConfigId] = useState(configId);
   const [name, setName] = useState("");
   const [config, setConfig] = useState({ nodes: [], edges: [] });
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [agentConfigs, setAgentConfigs] = useState([]);
+  const [constantFiles, setConstantFiles] = useState([]);
+  const [previewFile, setPreviewFile] = useState(null);
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState(null);
   const [loading, setLoading] = useState(Boolean(configId));
+  const [fileBusy, setFileBusy] = useState(false);
   const [graphLoaded, setGraphLoaded] = useState(!configId);
   const [loadFailed, setLoadFailed] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!configId) return undefined;
     const controller = new AbortController();
     async function load() {
       try {
-        const response = await fetch(`/api/workflow-configs/${encodeURIComponent(configId)}`, { signal: controller.signal });
-        if (!response.ok) throw new Error("Unable to load workflow configuration.");
-        const saved = await response.json();
-        const parsed = typeof saved.config === "string" ? JSON.parse(saved.config) : saved.config;
-        const graph = graphFromConfig(parsed);
-        setName(saved.name);
-        setConfig(parsed);
-        setNodes(graph.nodes);
-        setEdges(graph.edges);
-        setGraphLoaded(true);
+        const [agents, saved] = await Promise.all([
+          fetch("/api/agent-configs", { signal: controller.signal }).then(readResponse),
+          configId
+            ? fetch(`/api/workflow-configs/${encodeURIComponent(configId)}`, { signal: controller.signal }).then(readResponse)
+            : Promise.resolve(null),
+        ]);
+        if (controller.signal.aborted) return;
+        setAgentConfigs(agents);
+        if (saved) {
+          const parsed = typeof saved.config === "string" ? JSON.parse(saved.config) : saved.config;
+          const graph = graphFromConfig(parsed);
+          setName(saved.name);
+          setConfig(parsed);
+          setNodes(graph.nodes);
+          setEdges(graph.edges);
+          setGraphLoaded(true);
+        }
       } catch (failure) {
-        if (failure.name !== "AbortError") {
+        if (failure.name !== "AbortError" && !controller.signal.aborted) {
           setLoadFailed(true);
           setError(failure.message);
         }
@@ -43,6 +75,18 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
     load();
     return () => controller.abort();
   }, [configId, setNodes, setEdges]);
+
+  useEffect(() => {
+    if (!savedConfigId) return undefined;
+    const controller = new AbortController();
+    fetch(`/api/workflow-configs/${encodeURIComponent(savedConfigId)}/constant-files`, { signal: controller.signal })
+      .then(readResponse)
+      .then(setConstantFiles)
+      .catch((failure) => {
+        if (failure.name !== "AbortError" && !controller.signal.aborted) setError(failure.message);
+      });
+    return () => controller.abort();
+  }, [savedConfigId]);
 
   const onConnect = useCallback((connection) => {
     setEdges((current) => addEdge({ ...connection, data: { workflowEdge: {} } }, current));
@@ -59,7 +103,7 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
     const id = `${type}-${number}`;
     const node = { id, type, label: NODE_TYPES[type].label };
     if (type === "agent") node.agent_id = "";
-    if (type === "data_source") node.source_type = "manual";
+    if (type === "data_source") node.source_type = "constant_file";
     setNodes((current) => [...current.map((item) => ({ ...item, selected: false })), {
       id, position: { x: 80 + (current.length % 4) * 200, y: 80 + Math.floor(current.length / 4) * 120 },
       data: { label: node.label, workflowNode: node }, style: nodeStyle(type), selected: true,
@@ -73,10 +117,19 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId);
 
   function updateNode(field, value) {
+    const selectedFile = field === "file_id" ? constantFiles.find((file) => file.id === value) : null;
     setNodes((current) => current.map((node) => {
       if (node.id !== selectedNodeId) return node;
       const workflowNode = { ...node.data.workflowNode, [field]: value };
-      return { ...node, data: { ...node.data, workflowNode, ...(field === "label" ? { label: value } : {}) } };
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          workflowNode,
+          ...(field === "label" ? { label: value } : {}),
+          ...(selectedFile ? { label: selectedFile.filename } : {}),
+        },
+      };
     }));
   }
 
@@ -106,16 +159,15 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch(configId ? `/api/workflow-configs/${encodeURIComponent(configId)}` : "/api/workflow-configs", {
-        method: configId ? "PUT" : "POST",
+      const response = await fetch(savedConfigId ? `/api/workflow-configs/${encodeURIComponent(savedConfigId)}` : "/api/workflow-configs", {
+        method: savedConfigId ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim(), config: configFromGraph(config, nodes, edges) }),
       });
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(typeof data.detail === "string" ? data.detail : "Save failed. Check the workflow and try again.");
-      }
-      onSave?.(await response.json());
+      const saved = await readResponse(response);
+      setSavedConfigId(saved.id);
+      setConfig(typeof saved.config === "string" ? JSON.parse(saved.config) : saved.config);
+      onSave?.(saved, { keepOpen: true });
     } catch (failure) {
       setError(failure.message);
     } finally {
@@ -124,12 +176,12 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
   }
 
   async function handleDelete() {
-    if (!configId || !window.confirm("Are you sure you want to delete this workflow?")) return;
+    if (!savedConfigId || !window.confirm("Are you sure you want to delete this workflow?")) return;
     setLoading(true);
     setError("");
     try {
-      const response = await fetch(`/api/workflow-configs/${encodeURIComponent(configId)}`, { method: "DELETE" });
-      if (!response.ok) throw new Error("Delete failed.");
+      const response = await fetch(`/api/workflow-configs/${encodeURIComponent(savedConfigId)}`, { method: "DELETE" });
+      await readResponse(response);
       onSave?.();
     } catch (failure) {
       setError(failure.message);
@@ -138,17 +190,105 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
     }
   }
 
+  async function uploadConstantFile(file, fileId = null) {
+    if (!file) return;
+    if (!savedConfigId) {
+      setError("Save the workflow before adding constant files.");
+      return;
+    }
+    if (file.size > MAX_FILE_BYTES) {
+      setError(`Files must be ${MAX_FILE_BYTES.toLocaleString()} bytes or smaller.`);
+      return;
+    }
+    setFileBusy(true);
+    setError("");
+    try {
+      const content_base64 = await encodeFile(file);
+      const url = `/api/workflow-configs/${encodeURIComponent(savedConfigId)}/constant-files${fileId ? `/${encodeURIComponent(fileId)}` : ""}`;
+      const response = await fetch(url, {
+        method: fileId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name, content_base64 }),
+      });
+      const saved = await readResponse(response);
+      setConstantFiles((current) => {
+        const withoutFile = current.filter((entry) => entry.id !== saved.id);
+        return [...withoutFile, { ...saved, content: undefined }].sort((a, b) => a.filename.localeCompare(b.filename));
+      });
+      setNodes((current) => current.map((node) => (
+        node.data.workflowNode.file_id === saved.id
+          ? { ...node, data: { ...node.data, label: saved.filename } }
+          : node
+      )));
+      if (previewFile?.id === saved.id) setPreviewFile({ ...saved });
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setFileBusy(false);
+    }
+  }
+
+  async function inspectConstantFile(file) {
+    setFileBusy(true);
+    setError("");
+    try {
+      const response = await fetch(
+        `/api/workflow-configs/${encodeURIComponent(savedConfigId)}/constant-files/${encodeURIComponent(file.id)}`,
+      );
+      setPreviewFile(await readResponse(response));
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setFileBusy(false);
+    }
+  }
+
+  async function removeConstantFile(file) {
+    if (!window.confirm(`Remove ${file.filename} from this workflow?`)) return;
+    setFileBusy(true);
+    setError("");
+    try {
+      const response = await fetch(
+        `/api/workflow-configs/${encodeURIComponent(savedConfigId)}/constant-files/${encodeURIComponent(file.id)}`,
+        { method: "DELETE" },
+      );
+      await readResponse(response);
+      setConstantFiles((current) => current.filter((entry) => entry.id !== file.id));
+      setNodes((current) => current.map((node) => {
+        if (node.data.workflowNode.file_id !== file.id) return node;
+        const workflowNode = { ...node.data.workflowNode, source_type: "manual" };
+        delete workflowNode.file_id;
+        return { ...node, data: { ...node.data, label: workflowNode.label || "Data source", workflowNode } };
+      }));
+      if (previewFile?.id === file.id) setPreviewFile(null);
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setFileBusy(false);
+    }
+  }
+
+  function agentsReceiving(fileId) {
+    const sourceIds = new Set(nodes
+      .filter((node) => node.data.workflowNode.file_id === fileId)
+      .map((node) => node.id));
+    return nodes
+      .filter((node) => node.data.workflowNode.type === "agent"
+        && edges.some((edge) => sourceIds.has(edge.source) && edge.target === node.id))
+      .map((node) => node.data.label || "Agent");
+  }
+
   return (
     <div className="workflow-editor" role="dialog" aria-modal="true" aria-labelledby="workflow-editor-title">
       <header className="workflow-editor-header">
-        <h2 id="workflow-editor-title">{configId ? "Edit Workflow" : "New Workflow"}</h2>
+        <h2 id="workflow-editor-title">{savedConfigId ? "Edit Workflow" : "New Workflow"}</h2>
         <label className="workflow-name">Name
           <input value={name} onChange={(event) => setName(event.target.value)} maxLength={200} placeholder="Workflow name" disabled={loading || loadFailed} />
         </label>
         <div className="workflow-editor-actions">
-          {configId && <button className="delete-btn" onClick={handleDelete} disabled={loading}>Delete workflow</button>}
+          {savedConfigId && <button className="delete-btn" onClick={handleDelete} disabled={loading || fileBusy}>Delete workflow</button>}
           <button onClick={onClose} disabled={loading}>Cancel</button>
-          <button className="save-btn" onClick={handleSave} disabled={loading || loadFailed}>Save</button>
+          <button className="save-btn" onClick={handleSave} disabled={loading || fileBusy || loadFailed}>Save</button>
         </div>
       </header>
       {error && <div className="workflow-editor-error" role="alert">{error}</div>}
@@ -156,9 +296,56 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
         <aside className="workflow-editor-palette">
           <h3>Add node</h3>
           {Object.entries(NODE_TYPES).map(([type, definition]) => (
-            <button key={type} onClick={() => addNode(type)} disabled={loading || loadFailed}>+ {definition.label}</button>
+            <button key={type} onClick={() => addNode(type)} disabled={loading || fileBusy || loadFailed}>+ {definition.label}</button>
           ))}
           <p>Connect nodes by dragging between their handles. Select a node or edge to edit it.</p>
+          <section className="constant-file-library" aria-label="Constant files">
+            <h3>Constant files</h3>
+            <label className={`constant-file-upload${!savedConfigId || fileBusy ? " disabled" : ""}`}>
+              Upload text file
+              <input
+                type="file"
+                accept={FILE_ACCEPT}
+                disabled={!savedConfigId || fileBusy || loading || loadFailed}
+                onChange={(event) => {
+                  void uploadConstantFile(event.target.files?.[0]);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+            {!savedConfigId && <p>Save the workflow before adding files.</p>}
+            {constantFiles.map((file) => {
+              const recipients = agentsReceiving(file.id);
+              return (
+                <article className="constant-file-item" key={file.id}>
+                  <strong title={file.filename}>{file.filename}</strong>
+                  <small>Receives: {recipients.length ? recipients.join(", ") : "No connected agents"}</small>
+                  <div className="constant-file-actions">
+                    <button onClick={() => inspectConstantFile(file)} disabled={fileBusy}>View</button>
+                    <label className={`constant-file-replace${fileBusy ? " disabled" : ""}`}>
+                      Replace
+                      <input
+                        type="file"
+                        accept={FILE_ACCEPT}
+                        disabled={fileBusy || loading || loadFailed}
+                        onChange={(event) => {
+                          void uploadConstantFile(event.target.files?.[0], file.id);
+                          event.target.value = "";
+                        }}
+                      />
+                    </label>
+                    <button className="delete-btn" onClick={() => removeConstantFile(file)} disabled={fileBusy}>Remove</button>
+                  </div>
+                </article>
+              );
+            })}
+            {previewFile && (
+              <div className="constant-file-preview">
+                <div><strong>{previewFile.filename}</strong><button onClick={() => setPreviewFile(null)} aria-label="Close file preview">×</button></div>
+                <pre>{previewFile.content}</pre>
+              </div>
+            )}
+          </section>
         </aside>
         <div className="workflow-editor-canvas">
           <ReactFlow key={graphLoaded ? "loaded" : "loading"} nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
@@ -177,10 +364,43 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
               <p>{NODE_TYPES[selectedNode.data.workflowNode.type].label}</p>
               <label>Label<input value={selectedNode.data.label} onChange={(event) => updateNode("label", event.target.value)} /></label>
               {selectedNode.data.workflowNode.type === "agent" && (
-                <label>Agent ID<input value={selectedNode.data.workflowNode.agent_id || ""} onChange={(event) => updateNode("agent_id", event.target.value)} /></label>
+                <label>Agent
+                  <select value={selectedNode.data.workflowNode.agent_id || ""} onChange={(event) => updateNode("agent_id", event.target.value)}>
+                    <option value="">Select an agent</option>
+                    {selectedNode.data.workflowNode.agent_id && !agentConfigs.some((agent) => agent.id === selectedNode.data.workflowNode.agent_id)
+                      && <option value={selectedNode.data.workflowNode.agent_id}>{selectedNode.data.workflowNode.agent_id}</option>}
+                    {agentConfigs.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}
+                  </select>
+                </label>
               )}
               {selectedNode.data.workflowNode.type === "data_source" && (
-                <label>Source type<input value={selectedNode.data.workflowNode.source_type || ""} onChange={(event) => updateNode("source_type", event.target.value)} placeholder="e.g. manual, files, chat" /></label>
+                <>
+                  <label>Source type
+                    <select value={selectedNode.data.workflowNode.source_type || "manual"} onChange={(event) => updateNode("source_type", event.target.value)}>
+                      <option value="constant_file">Constant file</option>
+                      <option value="manual">Manual</option>
+                      <option value="files">Other files</option>
+                      <option value="chat">Chat</option>
+                    </select>
+                  </label>
+                  {selectedNode.data.workflowNode.source_type === "constant_file" && (
+                    <>
+                      <label>File
+                        <select value={selectedNode.data.workflowNode.file_id || ""} onChange={(event) => updateNode("file_id", event.target.value)}>
+                          <option value="">Select a constant file</option>
+                          {constantFiles.map((file) => <option value={file.id} key={file.id}>{file.filename}</option>)}
+                        </select>
+                      </label>
+                      <p className="constant-file-recipients">
+                        Receives: {edges.filter((edge) => edge.source === selectedNode.id)
+                          .map((edge) => nodes.find((node) => node.id === edge.target))
+                          .filter((node) => node?.data.workflowNode.type === "agent")
+                          .map((node) => node.data.label || "Agent").join(", ") || "Connect this source to an agent."}
+                      </p>
+                      {!constantFiles.length && <p>Upload a constant file in the left panel first.</p>}
+                    </>
+                  )}
+                </>
               )}
               <label>Output<input value={selectedNode.data.workflowNode.output || ""} onChange={(event) => updateNode("output", event.target.value)} /></label>
               {selectedNode.data.workflowNode.type === "agent" && (
@@ -189,12 +409,12 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
               {selectedNode.data.workflowNode.type === "review" && (
                 <label>Input<input value={selectedNode.data.workflowNode.input || ""} onChange={(event) => updateNode("input", event.target.value)} /></label>
               )}
-              <button className="delete-btn" onClick={deleteSelection} disabled={loading}>Delete node</button>
+              <button className="delete-btn" onClick={deleteSelection} disabled={loading || fileBusy}>Delete node</button>
             </>
           ) : selectedEdge ? (
             <>
               <label>Data<input value={typeof selectedEdge.data?.workflowEdge?.data === "string" ? selectedEdge.data.workflowEdge.data : ""} onChange={(event) => updateEdge(event.target.value)} /></label>
-              <button className="delete-btn" onClick={deleteSelection} disabled={loading}>Delete edge</button>
+              <button className="delete-btn" onClick={deleteSelection} disabled={loading || fileBusy}>Delete edge</button>
             </>
           ) : <p>Select a node or edge to edit its properties.</p>}
           </fieldset>

@@ -148,9 +148,20 @@ export default function App() {
     setError("");
     let createdSessionId = null;
     try {
+      const selectedWorkflow = workflowConfigs.find((item) => item.id === selectedWorkflowId);
+      let configId = "default";
+      if (selectedWorkflow) {
+        const savedConfig = typeof selectedWorkflow.config === "string"
+          ? JSON.parse(selectedWorkflow.config)
+          : selectedWorkflow.config;
+        const activeAgent = savedConfig.nodes?.find(
+          (node) => node.type === "agent" && typeof node.agent_id === "string" && node.agent_id,
+        );
+        if (activeAgent) configId = activeAgent.agent_id;
+      }
       const result = await request("/api/sessions", {
         method: "POST",
-        body: JSON.stringify({ config_id: "75fd9b5a-b982-441c-8349-6194865463c8", prompt: content, workflow_id: selectedWorkflowId }),
+        body: JSON.stringify({ config_id: configId, prompt: content, workflow_id: selectedWorkflowId }),
       });
       createdSessionId = result.session_id;
       activeSessionRef.current = result.session_id;
@@ -347,8 +358,8 @@ export default function App() {
                 setEditingWorkflowId(null);
                 refreshLists();
               }}
-              onSave={(saved) => {
-                setEditingWorkflowId(null);
+              onSave={(saved, options) => {
+                if (!options?.keepOpen) setEditingWorkflowId(null);
                 refreshLists();
               }}
             />
@@ -381,6 +392,12 @@ export default function App() {
                 <p className="eyebrow">AGENT 1 · ACTIVE</p>
                 <h1>What should we work on?</h1>
               </div>
+              {workflow?.constant_files?.length > 0 && (
+                <aside className="session-constant-files" aria-label="Constant files provided to Agent 1">
+                  <strong>Constant files provided to Agent 1</strong>
+                  <ul>{workflow.constant_files.map((file) => <li key={file.id}>{file.filename}</li>)}</ul>
+                </aside>
+              )}
               <div className="message-list" aria-live="polite">
                 {messages.map((message, index) => (
                   <article

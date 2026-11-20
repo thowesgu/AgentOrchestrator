@@ -1,3 +1,4 @@
+import base64
 import json
 import unittest
 
@@ -14,6 +15,7 @@ class FakeStore:
             "default": {"id": "default", "name": "Agent 1", "instructions": "Role", "expected_result": ""}
         }
         self.saved_workflow_configs = {}
+        self.saved_constant_files = {}
 
     def agent_config(self, config_id: str) -> object | None:
         return self.agent_configs.get(config_id)
@@ -23,6 +25,28 @@ class FakeStore:
 
     def workflow_config(self, config_id: str) -> object | None:
         return self.saved_workflow_configs.get(config_id)
+
+    def constant_files(self, workflow_id: str) -> list[dict[str, object]]:
+        return [
+            {key: value for key, value in file.items() if key != "content"}
+            for file in self.saved_constant_files.values()
+            if file["workflow_id"] == workflow_id
+        ]
+
+    def constant_file(self, workflow_id: str, file_id: str) -> object | None:
+        file = self.saved_constant_files.get(file_id)
+        return file if file and file["workflow_id"] == workflow_id else None
+
+    def save_constant_file(self, value: dict[str, object]) -> None:
+        self.saved_constant_files[value["id"]] = {
+            **value, "byte_size": len(value["content"].encode("utf-8")),
+        }
+
+    def delete_constant_file(self, workflow_id: str, file_id: str) -> bool:
+        if self.constant_file(workflow_id, file_id) is None:
+            return False
+        del self.saved_constant_files[file_id]
+        return True
 
 
 class FakeAgent:
@@ -38,7 +62,7 @@ class FakeAgent:
         return None
 
     async def open_conversation(
-        self, session_id: str | None, config_id: str = "default"
+        self, session_id: str | None, config_id: str = "default", workflow_id: str | None = None
     ) -> tuple[str, list[ChatMessage]]:
         return session_id or "new-session", [ChatMessage("assistant", "Hello.")]
 
@@ -148,6 +172,54 @@ class WebApiTests(unittest.TestCase):
         oversized = self.client.post("/api/workflow-configs", json={"name": "Graph", "config": {"data": "x" * 100_000}})
         self.assertEqual(oversized.status_code, 422)
 
+    def test_constant_files_are_validated_persisted_replaceable_and_removable(self) -> None:
+        workflow = self.client.post(
+            "/api/workflow-configs",
+            json={"name": "Files", "config": {"nodes": [], "edges": []}},
+        ).json()
+        base = f"/api/workflow-configs/{workflow['id']}/constant-files"
+        upload = self.client.post(base, json={
+            "filename": "notes.md",
+            "content_base64": "SGVsbG8gV29ybGQ=",
+        })
+        self.assertEqual(upload.status_code, 200)
+        file = upload.json()
+        self.assertEqual(file["content"], "Hello World")
+        self.assertEqual(file["byte_size"], 11)
+        self.assertNotIn("content", self.client.get(base).json()[0])
+
+        replaced = self.client.put(
+            f"{base}/{file['id']}",
+            json={"filename": "updated.txt", "content_base64": "bmV3IGNvbnRlbnQ="},
+        )
+        self.assertEqual(replaced.status_code, 200)
+        self.assertEqual(replaced.json()["content"], "new content")
+        self.assertEqual(self.client.delete(f"{base}/{file['id']}").status_code, 200)
+        self.assertEqual(self.client.get(base).json(), [])
+
+    def test_constant_files_reject_unsupported_invalid_and_oversized_content(self) -> None:
+        workflow = self.client.post(
+            "/api/workflow-configs",
+            json={"name": "Files", "config": {"nodes": [], "edges": []}},
+        ).json()
+        base = f"/api/workflow-configs/{workflow['id']}/constant-files"
+        unsupported = self.client.post(
+            base, json={"filename": "image.png", "content_base64": "aW1hZ2U="}
+        )
+        self.assertEqual(unsupported.status_code, 422)
+        malformed = self.client.post(
+            base, json={"filename": "notes.txt", "content_base64": "not base64"}
+        )
+        self.assertEqual(malformed.status_code, 422)
+        oversized = self.client.post(
+            base,
+            json={
+                "filename": "notes.txt",
+                "content_base64": base64.b64encode(b"a" * (1_048_576 + 1)).decode("ascii"),
+            },
+        )
+        self.assertEqual(oversized.status_code, 422)
+
     def test_unknown_session_is_not_reported_as_success(self) -> None:
         response = self.client.post(
             "/api/sessions/expired/messages", json={"content": "Hello"}
@@ -163,7 +235,10 @@ class WebApiTests(unittest.TestCase):
         )
         self.assertEqual(response.json()["workflow"]["stage"], "agent1")
 
-        finalized = self.client.post(f"/api/sessions/{session_id}/finalize")
+        finalized = self.client.post(
+            f"/api/sessions/{session_id}/finalize",
+            json={"prompt": "Please provide a final answer."},
+        )
         self.assertEqual(finalized.status_code, 200)
         self.assertEqual(finalized.json()["stage"], "review")
 

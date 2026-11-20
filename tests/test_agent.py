@@ -121,6 +121,93 @@ class AgentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["nodes"], graph["nodes"])
         self.assertEqual(result["edges"], graph["edges"])
 
+    async def test_only_connected_constant_files_are_injected_and_recorded(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        graph = {
+            "nodes": [
+                {"id": "source-for-default", "type": "data_source", "source_type": "constant_file", "file_id": "file-default"},
+                {"id": "source-for-other", "type": "data_source", "source_type": "constant_file", "file_id": "file-other"},
+                {"id": "default-agent", "type": "agent", "agent_id": "default"},
+                {"id": "other-agent", "type": "agent", "agent_id": "other-agent"},
+            ],
+            "edges": [
+                {"source": "source-for-default", "target": "default-agent"},
+                {"source": "source-for-other", "target": "other-agent"},
+            ],
+        }
+        service.store.save_workflow_config({
+            "id": "workflow-files", "name": "With files", "config": json.dumps(graph),
+        })
+        service.store.save_constant_file({
+            "id": "file-default", "workflow_id": "workflow-files",
+            "filename": "shared.md", "content": "Only for the default agent",
+        })
+        service.store.save_constant_file({
+            "id": "file-other", "workflow_id": "workflow-files",
+            "filename": "private.md", "content": "Only for another agent",
+        })
+
+        session_id, _ = await service.open_conversation(None, workflow_id="workflow-files")
+        system_message = client.created_messages[0]["system_message"]["content"]
+        accessed_files = service.get_workflow(session_id)["constant_files"]
+
+        self.assertIn("Only for the default agent", system_message)
+        self.assertNotIn("Only for another agent", system_message)
+        self.assertEqual(accessed_files, [{"id": "file-default", "filename": "shared.md"}])
+        self.assertEqual(
+            service.store.session(session_id)["constant_files"],
+            [{"id": "file-default", "filename": "shared.md"}],
+        )
+
+    async def test_connected_missing_constant_file_is_reported_before_session_creation(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        graph = {
+            "nodes": [
+                {"id": "source", "type": "data_source", "source_type": "constant_file", "file_id": "missing"},
+                {"id": "agent", "type": "agent", "agent_id": "default"},
+            ],
+            "edges": [{"source": "source", "target": "agent"}],
+        }
+        service.store.save_workflow_config({
+            "id": "broken-workflow", "name": "Broken", "config": json.dumps(graph),
+        })
+
+        with self.assertRaisesRegex(WorkflowTransitionError, "constant file is missing"):
+            await service.open_conversation(None, workflow_id="broken-workflow")
+        self.assertEqual(client.created_messages, [])
+
+    async def test_removing_constant_file_clears_graph_reference_and_workflow_delete_cleans_files(self) -> None:
+        service = self.track(CopilotAgentService())
+        graph = {
+            "nodes": [
+                {"id": "source", "type": "data_source", "source_type": "constant_file", "file_id": "file-1"},
+            ],
+            "edges": [],
+        }
+        service.store.save_workflow_config({
+            "id": "workflow-cleanup", "name": "Cleanup", "config": json.dumps(graph),
+        })
+        service.store.save_constant_file({
+            "id": "file-1", "workflow_id": "workflow-cleanup",
+            "filename": "notes.txt", "content": "Notes",
+        })
+
+        self.assertTrue(service.store.delete_constant_file("workflow-cleanup", "file-1"))
+        updated = json.loads(service.store.workflow_config("workflow-cleanup")["config"])
+        self.assertNotIn("file_id", updated["nodes"][0])
+        self.assertEqual(updated["nodes"][0]["source_type"], "manual")
+
+        service.store.save_constant_file({
+            "id": "file-2", "workflow_id": "workflow-cleanup",
+            "filename": "more.txt", "content": "More notes",
+        })
+        service.store.delete_workflow_config("workflow-cleanup")
+        self.assertIsNone(service.store.constant_file("workflow-cleanup", "file-2"))
+
     async def test_unknown_session_starts_new_conversation(self) -> None:
         service = self.track(CopilotAgentService())
         service._client = FakeClient()

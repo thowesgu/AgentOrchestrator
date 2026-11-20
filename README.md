@@ -10,6 +10,14 @@ summaries, messages, workflow state, and results are stored in SQLite. The defau
 `~/.agent-orchestrator/data.sqlite3`; set `AGENT_ORCHESTRATOR_DB` to choose a
 different location. Active Copilot runtime connections are process-local.
 
+Workflow editors can retain UTF-8 `.txt`, `.md`, `.csv`, `.json`, `.yaml`,
+`.yml`, `.xml`, and `.log` files up to 1 MiB per file. Save a workflow, upload
+files in its editor, select a file on a data-source node, and connect that node
+directly to the intended agent node. Only files connected to the active agent
+are included in its session context; the session lists the files it received.
+Replacing a file affects future sessions, and removing a file or its workflow
+also removes the retained file content.
+
 ## Run with Docker
 
 1. Provide a GitHub Copilot SDK credential to the container as
