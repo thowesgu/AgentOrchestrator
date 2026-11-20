@@ -54,6 +54,12 @@
 .workflow-editor h3 { margin: 0 0 16px; font-size: 15px; }
 .workflow-editor-palette button { display: block; width: 100%; margin-bottom: 8px; text-align: left; }
 .workflow-editor-palette p, .workflow-editor-details p { color: #64746a; font-size: 13px; line-height: 1.5; }
+.workflow-usage-card { margin-bottom: 20px; padding: 12px; border: 1px solid #dfe5dc; border-radius: 8px; background: #f7faf6; }
+.workflow-usage-card h3 { margin-bottom: 8px; }
+.workflow-editor-palette .workflow-usage-card p { margin: 4px 0; }
+.workflow-usage-card label { display: block; margin-top: 12px; font-size: 12px; font-weight: 600; }
+.workflow-usage-card input { width: 100%; margin-top: 6px; }
+.workflow-usage-card small { display: block; margin-top: 6px; color: #64746a; font-size: 11px; line-height: 1.4; }
 .workflow-editor-details label { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; font-size: 13px; }
 .workflow-editor-details fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .workflow-agent-inputs { margin: 0 0 16px; padding: 10px; border: 1px solid #dfe5dc; border-radius: 7px; background: #f7faf6; font-size: 12px; line-height: 1.5; }
@@ -97,6 +103,8 @@
   .workflow-editor-palette h3 { margin: 0; white-space: nowrap; }
   .workflow-editor-palette button { width: auto; margin: 0; }
   .workflow-editor-palette p { display: none; }
+  .workflow-editor-palette .workflow-usage-card p { display: block; }
+  .workflow-usage-card { flex: 0 0 180px; margin: 0; }
   .workflow-editor-canvas { min-height: 200px; }
   .workflow-editor-details { width: 170px; flex-basis: 170px; padding: 12px; }
   .constant-file-library { max-height: 220px; overflow-y: auto; margin-top: 0; padding-top: 0; border-top: 0; }

@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { formatUsage } from "./usage";
 import "./AgentEditor.css";
 
 export function AgentEditor({ configId, onClose, onSave }) {
@@ -7,6 +8,7 @@ export function AgentEditor({ configId, onClose, onSave }) {
     instructions: "",
     expected_result: "",
     interaction_mode: "interactive",
+    credit_limit: "",
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -15,9 +17,13 @@ export function AgentEditor({ configId, onClose, onSave }) {
     if (!configId) return;
     setLoading(true);
     fetch(`/api/agent-configs/${encodeURIComponent(configId)}`)
-      .then((r) => r.json())
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Could not load agent.");
+        return data;
+      })
       .then((data) => {
-        setForm(data);
+        setForm({ ...data, credit_limit: data.credit_limit ?? "" });
         setLoading(false);
       })
       .catch((err) => {
@@ -29,6 +35,14 @@ export function AgentEditor({ configId, onClose, onSave }) {
   async function handleSave() {
     if (!form.name.trim() || !form.instructions.trim()) {
       setError("Name and instructions are required.");
+      return;
+    }
+    if (form.credit_limit !== "" && (
+      !Number.isFinite(Number(form.credit_limit))
+      || Number(form.credit_limit) < 0
+      || Number(form.credit_limit) > 1_000_000_000
+    )) {
+      setError("Enter a credit limit between 0 and 1,000,000,000.");
       return;
     }
     if (form.interaction_mode === "autonomous" && !form.expected_result.trim()) {
@@ -45,7 +59,13 @@ export function AgentEditor({ configId, onClose, onSave }) {
       const response = await fetch(url, {
         method,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify({
+          name: form.name,
+          instructions: form.instructions,
+          expected_result: form.expected_result,
+          interaction_mode: form.interaction_mode,
+          credit_limit: form.credit_limit === "" ? null : Number(form.credit_limit),
+        }),
       });
       if (!response.ok) {
         const data = await response.json();
@@ -68,6 +88,12 @@ export function AgentEditor({ configId, onClose, onSave }) {
       </div>
       {error && <div className="error-message">{error}</div>}
       <div className="editor-form">
+        <section className="editor-usage-card" aria-label="Agent usage">
+          <h3>Usage across all sessions</h3>
+          <p>{formatUsage(form.usage?.credits, "credits")}</p>
+          <p>{formatUsage(form.usage?.tokens, "tokens")}</p>
+          {!configId && <small>Usage will appear after the agent runs.</small>}
+        </section>
         <div className="form-group">
           <label>Name</label>
           <input
@@ -120,6 +146,23 @@ export function AgentEditor({ configId, onClose, onSave }) {
           {form.interaction_mode === "autonomous" && (
             <p className="field-description">Required for autonomous agents; this instruction is sent with the initial task.</p>
           )}
+        </div>
+        <div className="form-group">
+          <label htmlFor="agent-credit-limit">Agent credit limit per session</label>
+          <input
+            id="agent-credit-limit"
+            type="number"
+            min="0"
+            max="1000000000"
+            step="any"
+            value={form.credit_limit}
+            onChange={(e) => setForm({ ...form, credit_limit: e.target.value })}
+            placeholder="No limit"
+            disabled={loading}
+          />
+          <p className="field-description">
+            Leave blank for no limit. The agent stops when reported credits reach this amount.
+          </p>
         </div>
         <div className="editor-actions">
           <button onClick={handleSave} disabled={loading} className="save-btn">

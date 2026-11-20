@@ -1,0 +1,66 @@
+.mcp-manager {
+  width: min(100%, 900px);
+  margin: 0 auto;
+  padding: 38px clamp(18px, 4vw, 48px);
+  overflow-y: auto;
+}
+
+.mcp-manager-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+}
+
+.mcp-manager-header .eyebrow { margin: 0 0 8px; }
+.mcp-manager-header h1 { margin: 0; font-size: clamp(26px, 4vw, 36px); letter-spacing: -.04em; }
+.mcp-manager-header .secondary-button { min-height: 36px; padding: 8px 13px; }
+.mcp-alert { margin-bottom: 14px; }
+.mcp-notice { margin-bottom: 14px; padding: 11px 14px; border-radius: 9px; background: #e8f0e9; color: #355a40; font-size: 13px; }
+
+.mcp-status-card, .mcp-form {
+  margin-bottom: 18px;
+  padding: 20px;
+  border: 1px solid #e3e5df;
+  border-radius: 14px;
+  background: #fff;
+}
+
+.mcp-status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.mcp-status-grid > div { display: grid; gap: 7px; }
+.mcp-status-grid span, .mcp-checked-at { color: #818a83; font-size: 11px; }
+.mcp-state { color: #59645d; font-size: 13px; }
+.state-connected, .state-authenticated { color: #38764a; }
+.state-disconnected, .state-required { color: #9c4c42; }
+.mcp-status-message { margin: 14px 0 0; color: #8d3b31; font-size: 13px; line-height: 1.5; }
+.mcp-checked-at { margin: 10px 0 0; }
+.mcp-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 16px; }
+.mcp-actions .secondary-button { min-height: 38px; padding: 8px 13px; font-size: 12px; }
+
+.mcp-form { display: grid; gap: 15px; }
+.mcp-form h2 { margin: 0 0 2px; color: #35443a; font-size: 17px; }
+.mcp-form label { display: grid; gap: 7px; color: #626c65; font-size: 12px; font-weight: 600; }
+.mcp-form input, .mcp-form textarea, .mcp-form select {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid #dfe2dc;
+  border-radius: 8px;
+  background: #fff;
+  color: #303833;
+  font: inherit;
+  font-size: 13px;
+}
+.mcp-form textarea { resize: vertical; font-family: "Cascadia Code", Consolas, monospace; }
+.mcp-form small, .mcp-help { margin: 0; color: #818a83; font-size: 11px; font-weight: 400; line-height: 1.5; }
+.mcp-reauth-form { border-color: #d7e3d8; background: #fbfcfa; }
+.mcp-reauth-form > .primary-button { justify-self: start; min-height: 38px; padding: 8px 14px; font-size: 12px; }
+.mcp-form-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
+.mcp-form-actions .primary-button { min-height: 40px; min-width: 0; padding: 9px 15px; font-size: 12px; }
+.mcp-form-actions .discard-button { min-height: 40px; padding: 8px; font-size: 12px; }
+
+@media (max-width: 560px) {
+  .mcp-manager { padding: 22px 4px; }
+  .mcp-status-card, .mcp-form { padding: 15px; }
+}

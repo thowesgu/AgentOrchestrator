@@ -38,6 +38,22 @@ function setValue(element, value) {
 (async () => {
   try {
     await waitFor(() => document.body.innerText.includes("Saved Agent") && document.body.innerText.includes("Saved Workflow"));
+    await waitFor(() => document.body.innerText.includes("Premium interactions"));
+    document.querySelector('[aria-label="Add MCP server"]').click();
+    const mcpForm = await waitFor(() => document.querySelector(".mcp-manager .mcp-form"));
+    setValue(mcpForm.querySelector("input"), "New MCP server");
+    const auth = [...mcpForm.querySelectorAll("select")].find((item) =>
+      [...item.options].some((option) => option.value === "atlassian_oauth"));
+    auth.value = "atlassian_oauth";
+    auth.dispatchEvent(new Event("change", { bubbles: true }));
+    await waitFor(() => mcpForm.querySelector('input[type="url"]').value === "https://mcp.atlassian.com/v2/mcp");
+    if (!mcpForm.querySelector('input[type="url"]').disabled) throw new Error("Atlassian endpoint must be fixed");
+    auth.value = "none";
+    auth.dispatchEvent(new Event("change", { bubbles: true }));
+    await waitFor(() => !mcpForm.querySelector('input[type="url"]').disabled);
+    setValue(mcpForm.querySelector('input[type="url"]'), "https://example.test/mcp");
+    mcpForm.querySelector('button[type="submit"]').click();
+    await waitFor(() => document.body.innerText.includes("No agent has been granted access"));
     document.querySelector('[aria-label="Create agent config"]').click();
     const editor = await waitFor(() => document.querySelector(".agent-editor"));
     setValue(editor.querySelector("input"), "New Agent");
@@ -49,7 +65,22 @@ function setValue(element, value) {
     if (getComputedStyle(node).borderColor !== "rgb(201, 75, 75)") {
       throw new Error("Waiting interactive branch is not highlighted red");
     }
-    node.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    [...document.querySelectorAll(".config-row")].find((item) => item.textContent.includes("Saved Agent")).click();
+    const savedAgent = await waitFor(() => document.querySelector('.agent-editor [aria-label="Agent usage"]'));
+    await waitFor(() => savedAgent.innerText.includes("7 credits") && savedAgent.innerText.includes("25 tokens"));
+    if (document.querySelector(".workflow-sidebar")) throw new Error("Session sidebar remains visible while editing agent");
+    document.querySelector(".agent-editor .close-btn").click();
+    await waitFor(() => document.querySelector(".workflow-sidebar"));
+    [...document.querySelectorAll(".config-row")].find((item) => item.textContent.includes("Saved Workflow")).click();
+    const workflowUsage = await waitFor(() => document.querySelector('[aria-label="Workflow usage"]'));
+    await waitFor(() => workflowUsage.innerText.includes("12 credits") && workflowUsage.innerText.includes("100 tokens"));
+    setValue(document.querySelector("#workflow-credit-limit"), "4");
+    document.querySelector(".workflow-editor .save-btn").click();
+    await waitFor(() => document.body.innerText.includes("Workflow saved successfully."));
+    document.querySelector(".workflow-editor-actions button:not(.delete-btn):not(.save-btn)").click();
+    await waitFor(() => document.querySelector('.react-flow__node[data-id="right"]'));
+    const activeNode = document.querySelector('.react-flow__node[data-id="right"]');
+    activeNode.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await waitFor(() => document.querySelector(".message-list")?.innerText.includes("Right branch reply"));
     setValue(document.querySelector("#message"), "Right message");
     document.querySelector(".composer").requestSubmit();
@@ -70,7 +101,13 @@ function setValue(element, value) {
 @unittest.skipUnless(BROWSER and (DIST / "index.html").exists(), "Built frontend and Chromium or Edge required")
 class FrontendBrowserTests(unittest.TestCase):
     def test_lists_creation_and_selected_branch_interaction(self) -> None:
-        state = {"agents": [{"id": "saved", "name": "Saved Agent"}], "requests": []}
+        state = {"agents": [{"id": "saved", "name": "Saved Agent"}], "mcp_servers": [], "requests": [],
+                 "workflow": {"id": "workflow", "name": "Saved Workflow", "credit_limit": 3,
+                              "config": {"nodes": [{"id": "start", "type": "start"},
+                                                    {"id": "agent", "type": "agent", "agent_id": "saved"}],
+                                         "edges": [{"source": "start", "target": "agent"}]},
+                              "usage": {"credits": {"status": "available", "value": 12},
+                                        "tokens": {"status": "available", "value": 100}}}}
         nodes = [
             {"id": "left", "type": "agent", "label": "Left", "position": {"x": 0, "y": 0}},
             {"id": "right", "type": "agent", "label": "Right", "position": {"x": 250, "y": 0}},
@@ -112,6 +149,43 @@ class FrontendBrowserTests(unittest.TestCase):
                     self.respond_json(state["agents"])
                 elif url.path == "/api/workflow-configs":
                     self.respond_json([{"id": "workflow", "name": "Saved Workflow"}])
+                elif url.path == "/api/workflow-configs/workflow":
+                    self.respond_json(state["workflow"])
+                elif url.path == "/api/workflow-configs/workflow/constant-files":
+                    self.respond_json([])
+                elif url.path == "/api/agent-configs/saved":
+                    self.respond_json({
+                        "id": "saved", "name": "Saved Agent", "instructions": "Role",
+                        "expected_result": "", "interaction_mode": "interactive", "credit_limit": None,
+                        "usage": {"credits": {"status": "available", "value": 7},
+                                  "tokens": {"status": "available", "value": 25}},
+                    })
+                elif url.path == "/api/mcp-servers":
+                    self.respond_json(state["mcp_servers"])
+                elif url.path == "/api/copilot/quota":
+                    self.respond_json({
+                        "status": "available",
+                        "account": "test-account",
+                        "scope": "Current GitHub Copilot account",
+                        "quotas": [{
+                            "id": "premium_interactions",
+                            "label": "Premium interactions",
+                            "unit": "premium interactions",
+                            "used_requests": 2,
+                            "entitlement_requests": 10,
+                            "remaining_requests": 8,
+                            "remaining_percentage": 80,
+                            "unlimited": False,
+                            "reset_date": None,
+                        }],
+                    })
+                elif url.path.startswith("/api/mcp-servers/"):
+                    server_id = url.path.rsplit("/", 1)[-1]
+                    server = next((item for item in state["mcp_servers"] if item["id"] == server_id), None)
+                    if server:
+                        self.respond_json(server)
+                    else:
+                        self.send_error(404)
                 elif url.path == "/api/sessions/session/workflow":
                     self.respond_json(workflow(parse_qs(url.query).get("node_id", ["left"])[0]))
                 elif url.path == "/" or url.path.startswith("/assets/"):
@@ -133,12 +207,32 @@ class FrontendBrowserTests(unittest.TestCase):
                 if self.path == "/api/agent-configs":
                     state["agents"].append({"id": "created", "name": payload["name"]})
                     self.respond_json(state["agents"][-1])
+                elif self.path == "/api/mcp-servers":
+                    server = {
+                        "id": "mcp-created", "name": payload["name"],
+                        "transport": payload["transport"], "url": payload["url"],
+                        "auth_type": payload["auth_type"], "has_credentials": False,
+                        "auth_header_names": [], "connection_status": "unknown",
+                        "authentication_status": "unknown", "status_message": "",
+                        "checked_at": None, "updated_at": "now",
+                    }
+                    state["mcp_servers"].append(server)
+                    self.respond_json(server)
                 elif self.path.endswith("/messages"):
                     result = workflow(payload.get("node_id", "left"))
                     result["messages"].append({"role": "user", "content": payload["content"]})
                     self.respond_json({"messages": result["messages"], "workflow": result})
                 elif self.path.endswith("/finalize"):
                     self.respond_json(workflow(payload.get("node_id", "left"), "complete"))
+                else:
+                    self.send_error(404)
+
+            def do_PUT(self) -> None:
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                state["requests"].append((self.path, payload))
+                if self.path == "/api/workflow-configs/workflow":
+                    state["workflow"].update(payload)
+                    self.respond_json(state["workflow"])
                 else:
                     self.send_error(404)
 
@@ -155,6 +249,8 @@ class FrontendBrowserTests(unittest.TestCase):
                 )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('data-ui-test="passed"', result.stdout)
+            self.assertTrue(any(path == "/api/workflow-configs/workflow" and payload["credit_limit"] == 4
+                                for path, payload in state["requests"]))
             self.assertIn(("/api/sessions/session/messages", {"content": "Right message", "node_id": "right"}), state["requests"])
             self.assertIn(("/api/sessions/session/finalize", {"prompt": "right result", "node_id": "right"}), state["requests"])
         finally:

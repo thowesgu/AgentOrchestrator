@@ -7,6 +7,7 @@ import {
   configFromGraph, flowNodeType, graphFromConfig, NODE_TYPES, nodeStyle, validateWorkflowGraph,
 } from "./workflowGraph";
 import "./WorkflowEditor.css";
+import { formatUsage } from "./usage";
 
 const MAX_FILE_BYTES = 1_048_576;
 const FILE_ACCEPT = ".txt,.md,.csv,.json,.yaml,.yml,.xml,.log";
@@ -48,6 +49,8 @@ async function encodeFile(file) {
 export function WorkflowEditor({ configId, onClose, onSave }) {
   const [savedConfigId, setSavedConfigId] = useState(configId);
   const [name, setName] = useState("");
+  const [creditLimit, setCreditLimit] = useState("");
+  const [usage, setUsage] = useState(null);
   const [config, setConfig] = useState({ nodes: [], edges: [] });
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
@@ -79,6 +82,8 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
           const parsed = typeof saved.config === "string" ? JSON.parse(saved.config) : saved.config;
           const graph = graphFromConfig(parsed);
           setName(saved.name);
+          setCreditLimit(saved.credit_limit ?? "");
+          setUsage(saved.usage);
           setConfig(parsed);
           setNodes(graph.nodes);
           setEdges(graph.edges);
@@ -96,6 +101,20 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
     load();
     return () => controller.abort();
   }, [configId, setNodes, setEdges]);
+
+  useEffect(() => {
+    if (!savedConfigId) return undefined;
+    const controller = new AbortController();
+    const refresh = () => fetch(`/api/workflow-configs/${encodeURIComponent(savedConfigId)}`, { signal: controller.signal })
+      .then(readResponse)
+      .then((saved) => setUsage(saved.usage))
+      .catch((failure) => {
+        if (failure.name !== "AbortError" && !controller.signal.aborted) setError(failure.message);
+      });
+    refresh();
+    const timer = setInterval(refresh, 30000);
+    return () => { controller.abort(); clearInterval(timer); };
+  }, [savedConfigId]);
 
   useEffect(() => {
     if (!savedConfigId) return undefined;
@@ -192,6 +211,14 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
       setError("Name is required.");
       return;
     }
+    if (creditLimit !== "" && (
+      !Number.isFinite(Number(creditLimit))
+      || Number(creditLimit) < 0
+      || Number(creditLimit) > 1_000_000_000
+    )) {
+      setError("Enter a credit limit between 0 and 1,000,000,000.");
+      return;
+    }
     const graph = configFromGraph(config, nodes, edges);
     const validationErrors = validateWorkflowGraph(nodes, edges);
     if (validationErrors.length) {
@@ -204,7 +231,10 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
       const response = await fetch(savedConfigId ? `/api/workflow-configs/${encodeURIComponent(savedConfigId)}` : "/api/workflow-configs", {
         method: savedConfigId ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), config: graph }),
+        body: JSON.stringify({
+          name: name.trim(), config: graph,
+          credit_limit: creditLimit === "" ? null : Number(creditLimit),
+        }),
       });
       const saved = await readResponse(response);
       setSavedConfigId(saved.id);
@@ -338,6 +368,16 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
       {saveMessage && <div className="workflow-editor-success" role="status">{saveMessage}</div>}
       <div className="workflow-editor-body">
         <aside className="workflow-editor-palette">
+          <section className="workflow-usage-card" aria-label="Workflow usage">
+            <h3>Usage across all sessions</h3>
+            <p>{formatUsage(usage?.credits, "credits")}</p>
+            <p>{formatUsage(usage?.tokens, "tokens")}</p>
+            <label htmlFor="workflow-credit-limit">Credit limit per session</label>
+            <input id="workflow-credit-limit" type="number" min="0" max="1000000000" step="any"
+              value={creditLimit} onChange={(event) => setCreditLimit(event.target.value)}
+              placeholder="No limit" disabled={loading || loadFailed} />
+            <small>Leave blank for no limit. Saving applies this limit to each session of this workflow.</small>
+          </section>
           <h3>Add node</h3>
           {Object.entries(NODE_TYPES).map(([type, definition]) => (
             <button key={type} onClick={() => addNode(type)}

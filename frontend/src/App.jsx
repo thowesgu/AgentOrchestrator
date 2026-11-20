@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { AgentEditor } from "./AgentEditor";
+import { MCPServerManager } from "./MCPServerManager";
 import { WorkflowEditor } from "./WorkflowEditor";
 import { WorkflowVisualization } from "./WorkflowVisualization";
+import { formatUsage } from "./usage";
 
 const WORKFLOW_STEPS = ["Agent 1", "Release", "Agent 2"];
 
@@ -48,8 +50,16 @@ export default function App() {
   const [error, setError] = useState("");
   const [editingConfigId, setEditingConfigId] = useState(null);
   const [agentConfigs, setAgentConfigs] = useState([]);
+  const [mcpServers, setMcpServers] = useState([]);
+  const [editingMcpServerId, setEditingMcpServerId] = useState(null);
   const [workflowConfigs, setWorkflowConfigs] = useState([]);
   const [editingWorkflowId, setEditingWorkflowId] = useState(null);
+  const [copilotQuota, setCopilotQuota] = useState({ status: "loading", quotas: [] });
+  const [quotaRefreshing, setQuotaRefreshing] = useState(false);
+  const [quotaRefreshVersion, setQuotaRefreshVersion] = useState(0);
+  const [sessionLimitDraft, setSessionLimitDraft] = useState("");
+  const [sessionLimitSaving, setSessionLimitSaving] = useState(false);
+  const [sessionLimitError, setSessionLimitError] = useState("");
   const endOfMessages = useRef(null);
   const activeSessionRef = useRef(null);
   const selectedNodeRef = useRef(null);
@@ -64,12 +74,14 @@ export default function App() {
 
   async function refreshLists() {
     try {
-      const [savedSessions, configs, workflows] = await Promise.all([
-        request("/api/sessions"), request("/api/agent-configs"), request("/api/workflow-configs"),
+      const [savedSessions, configs, workflows, servers] = await Promise.all([
+        request("/api/sessions"), request("/api/agent-configs"),
+        request("/api/workflow-configs"), request("/api/mcp-servers"),
       ]);
       setSessions(savedSessions);
       setAgentConfigs(configs);
       setWorkflowConfigs(workflows);
+      setMcpServers(servers);
       setSelectedWorkflowId((current) => (
         workflows.some((item) => item.id === current) ? current : workflows[0]?.id || ""
       ));
@@ -83,6 +95,33 @@ export default function App() {
     const timer = setInterval(refreshLists, 1200);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function refreshCopilotQuota() {
+      setQuotaRefreshing(true);
+      try {
+        const quota = await request("/api/copilot/quota", { cache: "no-store" });
+        if (!cancelled) setCopilotQuota(quota);
+      } catch (failure) {
+        if (!cancelled) {
+          setCopilotQuota({
+            status: "unavailable",
+            message: failure.message,
+            quotas: [],
+          });
+        }
+      } finally {
+        if (!cancelled) setQuotaRefreshing(false);
+      }
+    }
+    refreshCopilotQuota();
+    const timer = setInterval(refreshCopilotQuota, 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [quotaRefreshVersion]);
 
   useEffect(() => {
     endOfMessages.current?.scrollIntoView({ behavior: "smooth" });
@@ -134,7 +173,10 @@ export default function App() {
     selectedNodeRef.current = null;
     setSelectedNodeId(null);
     setEditingConfigId(null);
+    setEditingMcpServerId(null);
     setMessages(saved.messages || []);
+    setSessionLimitDraft(saved.credit_limit == null ? "" : String(saved.credit_limit));
+    setSessionLimitError("");
     setFinalizationPrompt(saved.expected_result || "");
     setWorkflow({
       stage: saved.stage, artifact_ready: false, artifact_content: null,
@@ -186,6 +228,32 @@ export default function App() {
     }
   }
 
+  async function saveSessionLimit(event) {
+    event.preventDefault();
+    const rawLimit = sessionLimitDraft.trim();
+    const creditLimit = rawLimit ? Number(rawLimit) : null;
+    if (creditLimit !== null && (!Number.isFinite(creditLimit) || creditLimit < 0 || creditLimit > 1_000_000_000)) {
+      setSessionLimitError("Enter a credit limit between 0 and 1,000,000,000.");
+      return;
+    }
+    setSessionLimitSaving(true);
+    setSessionLimitError("");
+    try {
+      const current = await request(
+        `/api/sessions/${encodeURIComponent(sessionId)}/limit`,
+        { method: "PUT", body: JSON.stringify({ credit_limit: creditLimit }) },
+      );
+      if (activeSessionRef.current === sessionId) {
+        setWorkflow(current);
+        setSessionLimitDraft(current.session_credit_limit == null ? "" : String(current.session_credit_limit));
+      }
+    } catch (failure) {
+      setSessionLimitError(failure.message);
+    } finally {
+      setSessionLimitSaving(false);
+    }
+  }
+
   async function startChat(event) {
     event?.preventDefault();
     const content = sessionPrompt.trim();
@@ -205,6 +273,7 @@ export default function App() {
       setWorkflowId(selectedWorkflowId);
       setMessages(result.messages);
       setWorkflow(result.workflow);
+      setSessionLimitDraft(result.workflow.session_credit_limit == null ? "" : String(result.workflow.session_credit_limit));
       const initialNodeId = result.workflow.active_node_id || null;
       selectedNodeRef.current = initialNodeId;
       setSelectedNodeId(initialNodeId);
@@ -315,6 +384,8 @@ export default function App() {
     setMessages([]);
     setWorkflow(null);
     setDraft("");
+    setSessionLimitDraft("");
+    setSessionLimitError("");
     setFinalizationPrompt("");
     setError("");
     setEditingConfigId(null);
@@ -349,22 +420,102 @@ export default function App() {
           {stage === "complete" ? "Workflow complete" : stage === "discarded" ? "Workflow discarded" : stage === "agent2_error" ? "Workflow failed" : "Workflow in progress"}
         </div>
       </header>
-      <div className="workflow-layout">
+      <div className={`workflow-layout${editingConfigId ? " editing-agent" : ""}`}>
         <aside className="agents-sidebar" aria-label="Agents and sessions">
           <div className="agents-heading">
             <span className="brand-mark small" aria-hidden="true">✳</span>
             <strong>Orchestrator</strong>
           </div>
+          <section className="copilot-quota" aria-label="GitHub Copilot licence budget">
+            <div className="copilot-quota-heading">
+              <div>
+                <strong>Copilot allowance</strong>
+                <small>
+                  Current GitHub Copilot account
+                  {copilotQuota.account ? ` · @${copilotQuota.account}` : ""}
+                </small>
+              </div>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Refresh Copilot allowance"
+                title="Refresh Copilot allowance"
+                disabled={quotaRefreshing}
+                onClick={() => setQuotaRefreshVersion((version) => version + 1)}
+              >↻</button>
+            </div>
+            {copilotQuota.status === "loading" ? (
+              <p className="copilot-quota-message" role="status">Loading licence quota…</p>
+            ) : copilotQuota.status !== "available" ? (
+              <p className="copilot-quota-message" role="status">
+                {copilotQuota.message || "Licence quota unavailable; this is not a zero balance."}
+              </p>
+            ) : (
+              <ul className="copilot-quota-list">
+                {copilotQuota.quotas.map((quota) => (
+                  <li key={quota.id}>
+                    <div>
+                      <span>{quota.label}</span>
+                      <strong>
+                        {quota.unlimited
+                          ? "Unlimited"
+                          : `${quota.remaining_requests.toLocaleString()} ${quota.unit} left`}
+                      </strong>
+                    </div>
+                    {!quota.unlimited && (
+                      <small>
+                        {quota.used_requests.toLocaleString()} of{" "}
+                        {quota.entitlement_requests.toLocaleString()} used
+                        {quota.reset_date
+                          ? ` · resets ${new Date(quota.reset_date).toLocaleDateString()}`
+                          : ""}
+                      </small>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+          <div className="sidebar-section-heading">
+            <span>MCP SERVERS</span>
+            <button
+              className="icon-button"
+              aria-label="Add MCP server"
+              onClick={() => {
+                setEditingConfigId(null);
+                setEditingWorkflowId(null);
+                setEditingMcpServerId("new");
+              }}
+            >+</button>
+          </div>
+          <div className="config-list">
+            {mcpServers.map((server) => (
+              <button
+                key={server.id}
+                className={`config-row ${editingMcpServerId === server.id ? "selected" : ""}`}
+                onClick={() => {
+                  setEditingConfigId(null);
+                  setEditingWorkflowId(null);
+                  setEditingMcpServerId(server.id);
+                }}
+              >
+                <span className="config-name">{server.name}</span>
+                <small className={`mcp-list-status state-${server.connection_status}`}>
+                  {server.connection_status === "connected" ? "Connected" : server.connection_status === "disconnected" ? "Disconnected" : "Status unknown"}
+                </small>
+              </button>
+            ))}
+          </div>
           <div className="sidebar-section-heading">
             <span>AGENT CONFIGS</span>
-            <button className="icon-button" aria-label="Create agent config" onClick={() => { setEditingWorkflowId(null); setEditingConfigId("new"); }}>+</button>
+            <button className="icon-button" aria-label="Create agent config" onClick={() => { setEditingWorkflowId(null); setEditingMcpServerId(null); setEditingConfigId("new"); }}>+</button>
           </div>
           <div className="config-list">
             {agentConfigs.map((config) => (
               <button
                 key={config.id}
                 className={`config-row ${editingConfigId === config.id ? "selected" : ""}`}
-                onClick={() => { setEditingWorkflowId(null); setEditingConfigId(config.id); }}
+                onClick={() => { setEditingWorkflowId(null); setEditingMcpServerId(null); setEditingConfigId(config.id); }}
               >
                 <span className="config-name">{config.name}</span>
               </button>
@@ -372,14 +523,14 @@ export default function App() {
           </div>
           <div className="sidebar-section-heading">
             <span>WORKFLOW CONFIGS</span>
-            <button className="icon-button" aria-label="Create workflow config" onClick={() => { setEditingConfigId(null); setEditingWorkflowId("new"); }}>+</button>
+            <button className="icon-button" aria-label="Create workflow config" onClick={() => { setEditingConfigId(null); setEditingMcpServerId(null); setEditingWorkflowId("new"); }}>+</button>
           </div>
           <div className="config-list">
             {workflowConfigs.map((config) => (
               <button
                 key={config.id}
                 className={`config-row ${editingWorkflowId === config.id ? "selected" : ""}`}
-                onClick={() => { setEditingConfigId(null); setEditingWorkflowId(config.id); }}
+                onClick={() => { setEditingConfigId(null); setEditingMcpServerId(null); setEditingWorkflowId(config.id); }}
               >
                 <span className="config-name">{config.name}</span>
               </button>
@@ -402,6 +553,7 @@ export default function App() {
         <section className="work-area" aria-label="Active workflow step">
           {editingConfigId && (
             <AgentEditor
+              key={editingConfigId}
               configId={editingConfigId === "new" ? null : editingConfigId}
               onClose={() => {
                 setEditingConfigId(null);
@@ -427,7 +579,23 @@ export default function App() {
               }}
             />
           )}
-          {!editingConfigId && !editingWorkflowId && !sessionId && (
+          {editingMcpServerId && (
+            <MCPServerManager
+              key={editingMcpServerId}
+              serverId={editingMcpServerId}
+              servers={mcpServers}
+              onClose={() => setEditingMcpServerId(null)}
+              onSaved={async (serverId) => {
+                await refreshLists();
+                if (serverId) setEditingMcpServerId(serverId);
+              }}
+              onDeleted={() => {
+                setEditingMcpServerId(null);
+                refreshLists();
+              }}
+            />
+          )}
+          {!editingConfigId && !editingWorkflowId && !editingMcpServerId && !sessionId && (
             <section className="new-session-panel">
               <div className="brand-mark" aria-hidden="true">✳</div>
               <p className="eyebrow">COPILOT WORKFLOW</p>
@@ -448,7 +616,7 @@ export default function App() {
               <p className="footnote">The release-gated Agent 1 → review → Agent 2 workflow is unchanged.</p>
             </section>
           )}
-          {sessionId && !editingConfigId && !editingWorkflowId && <>
+          {sessionId && !editingConfigId && !editingWorkflowId && !editingMcpServerId && <>
           {chatVisible && (
             <section className="conversation" aria-label={`Conversation with ${agentName}`}>
               <div className="conversation-heading">
@@ -638,9 +806,48 @@ export default function App() {
           </>}
         </section>
 
-        <aside className={`workflow-sidebar${sessionId ? " has-session" : ""}`} aria-label="Workflow progress">
+        {!editingConfigId && <aside className={`workflow-sidebar${sessionId ? " has-session" : ""}`} aria-label="Workflow progress">
           {sessionId ? (
             <>
+              <section className="session-usage" aria-label="Session usage">
+                <p className="eyebrow">CURRENT SESSION</p>
+                <h2>Usage</h2>
+                <dl className="usage-total">
+                  <div><dt>Session credits</dt><dd>{formatUsage(workflow?.usage?.credits, "credits")}</dd></div>
+                  <div><dt>Session tokens</dt><dd>{formatUsage(workflow?.usage?.tokens, "tokens")}</dd></div>
+                </dl>
+                {workflow?.usage?.agents?.length > 0 && (
+                  <ul className="agent-session-usage">
+                    {workflow.usage.agents.map((agent) => (
+                      <li key={`${agent.node_id || "agent"}-${agent.agent_id}`}>
+                        <strong>{agent.agent_name} · this session</strong>
+                        <span>{formatUsage(agent.credits, "credits")}</span>
+                        <span>{formatUsage(agent.tokens, "tokens")}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <form className="session-limit-form" onSubmit={saveSessionLimit}>
+                  <label htmlFor="session-credit-limit">Session credit limit</label>
+                  <div>
+                    <input
+                      id="session-credit-limit"
+                      type="number"
+                      min="0"
+                      max="1000000000"
+                      step="any"
+                      value={sessionLimitDraft}
+                      onChange={(event) => setSessionLimitDraft(event.target.value)}
+                      placeholder="No limit"
+                    />
+                    <button className="secondary-button" type="submit" disabled={sessionLimitSaving}>
+                      {sessionLimitSaving ? "Saving…" : "Save"}
+                    </button>
+                  </div>
+                  <small>Leave blank for no limit. The session stops when reported credits reach this amount.</small>
+                  {sessionLimitError && <p className="alert" role="alert">{sessionLimitError}</p>}
+                </form>
+              </section>
               <p className="eyebrow">WORKFLOW</p>
               <h2>Workflow Visualization</h2>
               <WorkflowVisualization workflow={workflow} onSelectNode={selectWorkflowNode} />
@@ -654,7 +861,7 @@ export default function App() {
               </p>
             </div>
           )}
-        </aside>
+        </aside>}
       </div>
     </main>
   );

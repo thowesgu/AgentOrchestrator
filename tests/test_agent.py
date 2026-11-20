@@ -1,7 +1,9 @@
 import asyncio
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,6 +24,15 @@ class FakeSession:
         self.should_fail = False
         self.messages: list[str] = []
         self.disconnected = False
+        self.handlers = []
+
+    def on(self, handler: object) -> object:
+        self.handlers.append(handler)
+        return lambda: self.handlers.remove(handler)
+
+    def emit(self, event: object) -> None:
+        for handler in list(self.handlers):
+            handler(event)
 
     async def send_and_wait(self, content: str) -> object:
         self.messages.append(content)
@@ -96,6 +107,129 @@ class AgentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session_id, resumed_id)
         self.assertEqual(first_history, resumed_history)
         self.assertEqual(first_history[0].role, "assistant")
+        self.assertEqual(service._client.created_messages[0]["tools"], {"available_tools": []})
+        self.assertNotIn("mcp_servers", service._client.created_messages[0])
+
+    async def test_usage_events_are_persisted_and_agent_limits_stop_the_session(self) -> None:
+        service = self.track(CopilotAgentService())
+        service._client = FakeClient()
+        service.store.save_agent_config({
+            "id": "default", "name": "Agent 1", "instructions": "Role",
+            "expected_result": "", "credit_limit": 2,
+        })
+        session_id, _ = await service.open_conversation(None)
+        session = service._client.session
+        session.emit(SimpleNamespace(
+            id="usage-event-1",
+            type=SimpleNamespace(value="assistant.usage"),
+            data=SimpleNamespace(
+                input_tokens=12,
+                output_tokens=8,
+                copilot_usage=SimpleNamespace(total_nano_aiu=2_000_000_000),
+            ),
+        ))
+
+        report = service.get_workflow(session_id)["usage"]
+        self.assertEqual(report["credits"]["status"], "available")
+        self.assertEqual(report["credits"]["value"], 2)
+        self.assertEqual(report["tokens"]["value"], 20)
+        service.set_session_credit_limit(session_id, 4)
+        self.assertEqual(service.get_workflow(session_id)["session_credit_limit"], 4)
+        self.assertEqual(service.store.session(session_id)["credit_limit"], 4)
+        service.set_session_credit_limit(session_id, None)
+        with self.assertRaises(WorkflowTransitionError):
+            await service.send_message(session_id, "Continue")
+        self.assertEqual(service.get_workflow(session_id)["stage"], "agent2_error")
+        self.assertIn("per-session credit limit", service.get_workflow(session_id)["error"])
+
+    async def test_agent_lifetime_usage_reports_untracked_sessions_as_partial(self) -> None:
+        service = self.track(CopilotAgentService())
+        service._client = FakeClient()
+        service.store.save_agent_config({
+            "id": "default", "name": "Agent 1", "instructions": "Role",
+            "expected_result": "",
+        })
+        session_id, _ = await service.open_conversation(None)
+        service._client.session.emit(SimpleNamespace(
+            id="usage-event-1",
+            type=SimpleNamespace(value="assistant.usage"),
+            data=SimpleNamespace(
+                input_tokens=12,
+                output_tokens=8,
+                copilot_usage=SimpleNamespace(total_nano_aiu=2_000_000_000),
+            ),
+        ))
+        service.store.save_session({
+            "id": "untracked-session",
+            "agent_id": "default",
+            "agent_name": "Agent 1",
+            "input": "",
+            "stage": "completed",
+            "status": "completed",
+        })
+
+        usage = service.store.agent_usage("default")
+
+        self.assertEqual(usage["credits"]["value"], 2)
+        self.assertEqual(usage["credits"]["status"], "partial")
+        self.assertEqual(usage["tokens"]["status"], "partial")
+
+    async def test_workflow_usage_and_limit_are_scoped_per_session(self) -> None:
+        service = self.track(CopilotAgentService())
+        service._client = FakeClient()
+        graph = {
+            "nodes": [{"id": "start", "type": "start"}, {"id": "agent", "type": "agent", "agent_id": "default"}],
+            "edges": [{"source": "start", "target": "agent"}],
+        }
+        service.store.save_workflow_config({
+            "id": "workflow", "name": "Workflow", "config": json.dumps(graph), "credit_limit": 2,
+        })
+        first_id, _ = await service.open_conversation(None, workflow_id="workflow")
+        service._client.sessions[first_id].emit(SimpleNamespace(
+            id="workflow-event",
+            type=SimpleNamespace(value="assistant.usage"),
+            data=SimpleNamespace(input_tokens=12, output_tokens=8,
+                                 copilot_usage=SimpleNamespace(total_nano_aiu=2_000_000_000)),
+        ))
+        second_id, _ = await service.open_conversation(None, workflow_id="workflow")
+        usage = service.store.workflow_usage("workflow")
+        self.assertEqual(usage["credits"]["value"], 2)
+        self.assertEqual(usage["credits"]["status"], "partial")
+        self.assertEqual(usage["tokens"]["value"], 20)
+        with self.assertRaises(WorkflowTransitionError):
+            await service.send_message(first_id, "Continue")
+        self.assertIn("workflow's per-session credit limit", service.get_workflow(first_id)["error"])
+        await service.send_message(second_id, "Continue")
+        service.store.delete_session(first_id)
+        self.assertEqual(service.store.workflow_usage("workflow")["credits"]["value"], 2)
+
+    async def test_workflow_usage_migrates_existing_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.sqlite3"
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("""CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent_name TEXT NOT NULL,
+                    workflow_id TEXT, input TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL
+                )""")
+                connection.execute("""CREATE TABLE usage_events (
+                    event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, node_id TEXT,
+                    agent_id TEXT NOT NULL, agent_name TEXT NOT NULL, token_count INTEGER,
+                    credit_count REAL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )""")
+                connection.execute(
+                    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("session", "agent", "Agent", "workflow", "", "complete", "completed"),
+                )
+                connection.execute(
+                    """INSERT INTO usage_events
+                    (event_id, session_id, agent_id, agent_name, token_count, credit_count)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    ("event", "session", "agent", "Agent", 12, 1.5),
+                )
+            store = Store(path)
+            self.assertEqual(store.workflow_usage("workflow")["credits"]["value"], 1.5)
+            store.delete_session("session")
+            self.assertEqual(store.workflow_usage("workflow")["tokens"]["value"], 12)
 
     async def test_workflow_graph_is_available_for_live_and_restored_sessions(self) -> None:
         service = self.track(CopilotAgentService())
@@ -456,6 +590,56 @@ class AgentServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(AgentUnavailableError):
             await service.open_conversation(None)
+
+    async def test_copilot_quota_tracks_the_active_account_and_distinguishes_zero(self) -> None:
+        class FakeAccount:
+            login = "first-user"
+            snapshots = {
+                "premium_interactions": SimpleNamespace(
+                    is_unlimited_entitlement=False,
+                    entitlement_requests=100,
+                    used_requests=40,
+                    remaining_percentage=60.0,
+                    reset_date="2026-12-01T00:00:00Z",
+                ),
+            }
+
+            async def get_current_auth(self) -> object:
+                return SimpleNamespace(auth_info=SimpleNamespace(login=self.login))
+
+            async def get_quota(self, _request: object) -> object:
+                return SimpleNamespace(quota_snapshots=self.snapshots)
+
+        service = self.track(CopilotAgentService())
+        account = FakeAccount()
+        client = FakeClient()
+        client.rpc = SimpleNamespace(account=account)
+        service._client = client
+
+        first = await service.get_copilot_quota()
+        self.assertEqual(first["status"], "available")
+        self.assertEqual(first["account"], "first-user")
+        self.assertEqual(first["quotas"][0]["remaining_requests"], 60)
+        self.assertEqual(first["quotas"][0]["unit"], "premium interactions")
+
+        account.login = "second-user"
+        account.snapshots = {
+            "premium_interactions": SimpleNamespace(
+                is_unlimited_entitlement=False,
+                entitlement_requests=100,
+                used_requests=100,
+                remaining_percentage=0.0,
+                reset_date=None,
+            ),
+        }
+        second = await service.get_copilot_quota()
+        self.assertEqual(second["account"], "second-user")
+        self.assertEqual(second["quotas"][0]["remaining_requests"], 0)
+
+        account.snapshots = {}
+        unavailable = await service.get_copilot_quota()
+        self.assertEqual(unavailable["status"], "unavailable")
+        self.assertEqual(unavailable["quotas"], [])
 
     async def test_message_history_contains_completed_reply(self) -> None:
         client = FakeClient()
