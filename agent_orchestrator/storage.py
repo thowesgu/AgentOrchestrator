@@ -53,13 +53,17 @@ class Store:
                     workflow_id TEXT, input TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
                     messages TEXT NOT NULL DEFAULT '[]', output TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '', artifact TEXT NOT NULL DEFAULT '',
+                    interaction_mode TEXT NOT NULL DEFAULT 'interactive',
+                    expected_result TEXT NOT NULL DEFAULT '',
+                    run_state TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )"""
             )
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS agent_configs (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, instructions TEXT NOT NULL,
-                    expected_result TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    expected_result TEXT, interaction_mode TEXT NOT NULL DEFAULT 'interactive',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )"""
             )
@@ -89,6 +93,25 @@ class Store:
         if "constant_files" not in columns:
             connection.execute(
                 "ALTER TABLE sessions ADD COLUMN constant_files TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "interaction_mode" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN interaction_mode TEXT NOT NULL DEFAULT 'interactive'"
+            )
+        if "expected_result" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN expected_result TEXT NOT NULL DEFAULT ''"
+            )
+        if "run_state" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN run_state TEXT NOT NULL DEFAULT '{}'"
+            )
+        agent_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(agent_configs)")
+        }
+        if "interaction_mode" not in agent_columns:
+            connection.execute(
+                "ALTER TABLE agent_configs ADD COLUMN interaction_mode TEXT NOT NULL DEFAULT 'interactive'"
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -146,17 +169,21 @@ class Store:
         with self._connection() as connection:
             connection.execute(
                 """INSERT INTO sessions
-                (id, agent_id, agent_name, workflow_id, input, stage, status, messages, output, error, artifact, constant_files, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                (id, agent_id, agent_name, workflow_id, input, stage, status, messages, output, error, artifact, constant_files, interaction_mode, expected_result, run_state, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(id) DO UPDATE SET agent_id=excluded.agent_id,
                   agent_name=excluded.agent_name, workflow_id=excluded.workflow_id, input=excluded.input, stage=excluded.stage,
                   status=excluded.status, messages=excluded.messages, output=excluded.output,
                   error=excluded.error, artifact=excluded.artifact, constant_files=excluded.constant_files,
+                  interaction_mode=excluded.interaction_mode, expected_result=excluded.expected_result,
+                  run_state=excluded.run_state,
                   updated_at=CURRENT_TIMESTAMP""",
                 (value["id"], value["agent_id"], value["agent_name"], value.get("workflow_id"), value["input"],
                  value["stage"], value["status"], json.dumps(value.get("messages", [])),
                  value.get("output", ""), value.get("error", ""), value.get("artifact", ""),
-                 json.dumps(value.get("constant_files", []))),
+                 json.dumps(value.get("constant_files", [])),
+                 value.get("interaction_mode", "interactive"), value.get("expected_result", ""),
+                 json.dumps(value.get("run_state", {}), ensure_ascii=False)),
             )
 
     def sessions(self) -> list[dict[str, Any]]:
@@ -183,6 +210,9 @@ class Store:
             "messages": json.loads(row["messages"]), "output": row["output"],
             "error": row["error"], "artifact": row["artifact"],
             "constant_files": json.loads(row["constant_files"]),
+            "interaction_mode": row["interaction_mode"],
+            "expected_result": row["expected_result"],
+            "run_state": json.loads(row["run_state"]),
             "updated_at": row["updated_at"],
         }
 
@@ -201,11 +231,13 @@ class Store:
     def save_agent_config(self, value: dict[str, Any]) -> None:
         with self._connection() as connection:
             connection.execute(
-                """INSERT INTO agent_configs(id, name, instructions, expected_result, updated_at)
-                VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """INSERT INTO agent_configs(id, name, instructions, expected_result, interaction_mode, updated_at)
+                VALUES(?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(id) DO UPDATE SET name=excluded.name, instructions=excluded.instructions,
-                  expected_result=excluded.expected_result, updated_at=CURRENT_TIMESTAMP""",
-                (value["id"], value["name"], value["instructions"], value.get("expected_result", "")),
+                  expected_result=excluded.expected_result, interaction_mode=excluded.interaction_mode,
+                  updated_at=CURRENT_TIMESTAMP""",
+                (value["id"], value["name"], value["instructions"], value.get("expected_result", ""),
+                 value.get("interaction_mode", "interactive")),
             )
 
     def agent_config(self, agent_id: str) -> dict[str, Any] | None:
@@ -228,7 +260,8 @@ class Store:
             "id": row["id"],
             "name": row["name"],
             "instructions": row["instructions"],
-            "expected_result": row["expected_result"],
+            "expected_result": row["expected_result"] or "",
+            "interaction_mode": row["interaction_mode"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

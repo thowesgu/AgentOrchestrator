@@ -1,14 +1,30 @@
 # Agent Orchestrator
 
 A release-gated React workflow backed by FastAPI and the GitHub Copilot SDK.
-Discuss the task with Agent 1 for as long as needed. Choosing **Use last answer**
-saves its latest reply as a temporary `agent-1-result.md` file for review. Then
-approve it to start Agent 2, continue the discussion, or discard the workflow.
-Agent 2's complete response is shown when processing finishes. The React build
-and API are served by the same container. Agent definitions and session
-summaries, messages, workflow state, and results are stored in SQLite. The default database is
+Configure each agent with an interactive or autonomous mode and an expected
+result. Interactive agents discuss the task until you choose **I've provided
+enough context**; they then receive the configured result prompt. Autonomous
+agents produce that result from the initial request.
+If an interactive agent has no configured result prompt, use **Use last answer
+as result** to release its latest reply. Results go to a configured
+review step, or directly to the next agent when no review step is present.
+Agent steps may fan out to multiple agents; branches run in parallel,
+interactive branches wait for user input, and downstream agents wait until all
+connected branches have completed. Waiting interactive agents are highlighted
+in red; click an agent in the workflow visualization to open its conversation.
+Reviews on parallel paths are presented when the other active paths have
+finished, and each approved result is passed to its connected steps.
+Downstream agents receive only their directly connected workflow inputs; the
+original request is not included automatically. Connect a chat data source to
+an agent when it needs that request, including additional agents connected
+directly to Start. A connected agent's output may itself contain information
+from earlier steps.
+The React build and API are served by the same container. Agent definitions and
+session summaries, messages, workflow state, and results are stored in SQLite. The default database is
 `~/.agent-orchestrator/data.sqlite3`; set `AGENT_ORCHESTRATOR_DB` to choose a
 different location. Active Copilot runtime connections are process-local.
+After a server restart, saved conversations remain available read-only; start a
+new session to interact with an agent again.
 
 Workflow editors can retain UTF-8 `.txt`, `.md`, `.csv`, `.json`, `.yaml`,
 `.yml`, `.xml`, and `.log` files up to 1 MiB per file. Save a workflow, upload

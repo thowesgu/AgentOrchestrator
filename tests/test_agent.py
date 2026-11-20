@@ -121,6 +121,240 @@ class AgentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["nodes"], graph["nodes"])
         self.assertEqual(result["edges"], graph["edges"])
 
+    async def test_parallel_interactive_branches_are_independent_and_join(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        for agent_id, mode in (("left", "interactive"), ("right", "interactive"), ("join", "autonomous")):
+            service.store.save_agent_config({
+                "id": agent_id, "name": agent_id, "instructions": f"Instructions {agent_id}",
+                "expected_result": f"Result {agent_id}", "interaction_mode": mode,
+            })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "first", "type": "agent", "agent_id": "default"},
+                *[{"id": name, "type": "agent", "agent_id": name} for name in ("left", "right", "join")],
+            ],
+            "edges": [
+                {"source": "start", "target": "first"},
+                {"source": "first", "target": "left"},
+                {"source": "first", "target": "right"},
+                {"source": "left", "target": "join"},
+                {"source": "right", "target": "join"},
+            ],
+        }
+        service.store.save_workflow_config({"id": "parallel", "name": "Parallel", "config": json.dumps(graph)})
+        session_id, _ = await service.open_conversation(None, workflow_id="parallel")
+        await service.send_message(session_id, "Build a plan", "first")
+        await service.submit_for_review(session_id, "First result", "first")
+        await asyncio.gather(*service._tasks)
+
+        left = service.get_workflow(session_id, "left")
+        right = service.get_workflow(session_id, "right")
+        self.assertEqual(set(left["active_node_ids"]), {"left", "right"})
+        self.assertEqual(left["agent_status"], "waiting")
+        self.assertEqual({item["node_id"] for item in left["agent_conversations"]}, {"left", "right"})
+        self.assertEqual(right["expected_result"], "Result right")
+        await service.send_message(session_id, "Left only", "left")
+        self.assertEqual(service.get_workflow(session_id, "left")["messages"][-2]["content"], "Left only")
+        self.assertNotIn("Left only", str(service.get_workflow(session_id, "right")["messages"]))
+        restored = CopilotAgentService()
+        restored.store = service.store
+        self.assertEqual(restored.get_workflow(session_id, "left")["agent_status"], "unavailable")
+        self.assertIn("Left only", str(restored.get_workflow(session_id, "left")["messages"]))
+        self.assertNotIn("Left only", str(restored.get_workflow(session_id, "right")["messages"]))
+
+        await service.submit_for_review(session_id, "ignored", "left")
+        self.assertEqual(service.get_workflow(session_id, "right")["stage"], "agent2")
+        self.assertEqual(set(service.get_workflow(session_id)["active_node_ids"]), {"right"})
+        self.assertNotIn("join", service._workflows[session_id].node_statuses)
+        await service.submit_for_review(session_id, "ignored", "right")
+        await asyncio.gather(*service._tasks)
+
+        result = service.get_workflow(session_id)
+        self.assertEqual(result["stage"], "complete")
+        join_instructions = client.created_messages[-1]["system_message"]["content"]
+        self.assertIn("Reply to: Result left", join_instructions)
+        self.assertIn("Reply to: Result right", join_instructions)
+
+    async def test_delete_parallel_session_cancels_and_cleans_every_branch(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "other", "name": "Other", "instructions": "Other role",
+            "expected_result": "Other result", "interaction_mode": "interactive",
+        })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "first", "type": "agent", "agent_id": "default"},
+                {"id": "other", "type": "agent", "agent_id": "other"},
+            ],
+            "edges": [
+                {"source": "start", "target": "first"},
+                {"source": "start", "target": "other"},
+            ],
+        }
+        service.store.save_workflow_config({"id": "cleanup", "name": "Cleanup", "config": json.dumps(graph)})
+        session_id, _ = await service.open_conversation(None, workflow_id="cleanup")
+        await service.send_message(session_id, "Request", "first")
+        await asyncio.gather(*service._tasks)
+        entered = asyncio.Event()
+
+        async def blocked_send(content: str) -> object:
+            entered.set()
+            await asyncio.Event().wait()
+
+        client.sessions["session-2"].send_and_wait = blocked_send
+        request = asyncio.create_task(service.send_message(session_id, "Wait", "other"))
+        await entered.wait()
+        self.assertEqual(service.get_workflow(session_id, "first")["agent_status"], "waiting")
+        self.assertEqual(service.get_workflow(session_id, "other")["agent_status"], "running")
+        await service.delete_session(session_id)
+        self.assertTrue(request.cancelled())
+        self.assertEqual(set(client.deleted_sessions), {"session-1", "session-2"})
+        self.assertFalse(service._conversations)
+        self.assertIsNone(service.store.session(session_id))
+
+    async def test_start_fanout_runs_both_interactive_agents(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "other", "name": "Other", "instructions": "Other role",
+            "expected_result": "Other result", "interaction_mode": "interactive",
+        })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "first", "type": "agent", "agent_id": "default"},
+                {"id": "other", "type": "agent", "agent_id": "other"},
+            ],
+            "edges": [
+                {"source": "start", "target": "first"},
+                {"source": "start", "target": "other"},
+            ],
+        }
+        service.store.save_workflow_config({"id": "fanout", "name": "Fanout", "config": json.dumps(graph)})
+        session_id, _ = await service.open_conversation(None, workflow_id="fanout")
+        await service.send_message(session_id, "Shared request", "first")
+        await asyncio.gather(*service._tasks)
+        self.assertEqual(set(service.get_workflow(session_id)["active_node_ids"]), {"first", "other"})
+        self.assertNotIn("Shared request", client.sessions["session-2"].messages[0])
+        self.assertNotIn("Shared request", client.created_messages[1]["system_message"]["content"])
+        await service.submit_for_review(session_id, "First result", "first")
+        self.assertEqual(service.get_workflow(session_id)["stage"], "agent2")
+        await service.submit_for_review(session_id, "Other result", "other")
+        self.assertEqual(service.get_workflow(session_id)["stage"], "complete")
+
+    async def test_start_fanout_waits_for_additional_agent_inputs(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "other", "name": "Other", "instructions": "Other role",
+            "expected_result": "Other result", "interaction_mode": "interactive",
+        })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "dependent", "type": "agent", "agent_id": "other"},
+                {"id": "first", "type": "agent", "agent_id": "default"},
+            ],
+            "edges": [
+                {"source": "start", "target": "dependent"},
+                {"source": "start", "target": "first"},
+                {"source": "first", "target": "dependent"},
+            ],
+        }
+        service.store.save_workflow_config({"id": "dependency", "name": "Dependency", "config": json.dumps(graph)})
+        session_id, _ = await service.open_conversation(None, workflow_id="dependency")
+        self.assertEqual(service.get_workflow(session_id)["active_node_id"], "first")
+        await service.send_message(session_id, "Request", "first")
+        self.assertEqual(len(client.sessions), 1)
+        await service.submit_for_review(session_id, "First result", "first")
+        await asyncio.gather(*service._tasks)
+        self.assertEqual(service.get_workflow(session_id)["active_node_id"], "dependent")
+        self.assertIn("Reply to: First result", client.created_messages[-1]["system_message"]["content"])
+
+    async def test_review_after_later_interactive_agent_supports_edit_and_approval(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "second", "name": "Second", "instructions": "Second role",
+            "expected_result": "Second result", "interaction_mode": "interactive",
+        })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "first", "type": "agent", "agent_id": "default"},
+                {"id": "second", "type": "agent", "agent_id": "second"},
+                {"id": "review", "type": "review"},
+            ],
+            "edges": [
+                {"source": "start", "target": "first"},
+                {"source": "first", "target": "second"},
+                {"source": "second", "target": "review"},
+            ],
+        }
+        service.store.save_workflow_config({"id": "review-later", "name": "Review", "config": json.dumps(graph)})
+        session_id, _ = await service.open_conversation(None, workflow_id="review-later")
+        await service.send_message(session_id, "Request", "first")
+        await service.submit_for_review(session_id, "First result", "first")
+        await asyncio.gather(*service._tasks)
+        await service.submit_for_review(session_id, "Second result", "second")
+        self.assertEqual(service.get_workflow(session_id)["stage"], "review")
+        await service.edit_result(session_id)
+        self.assertEqual(service.get_workflow(session_id)["active_node_ids"], ["second"])
+        await service.send_message(session_id, "Revise", "second")
+        await service.submit_for_review(session_id, "Second result", "second")
+        result = await service.approve_result(session_id)
+        self.assertEqual(result["stage"], "complete")
+        self.assertEqual(result["output"], "Reply to: Second result")
+
+    async def test_parallel_review_waits_for_other_branch_and_then_unblocks_join(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        for name in ("left", "right", "join"):
+            service.store.save_agent_config({
+                "id": name, "name": name, "instructions": name,
+                "expected_result": f"{name} result", "interaction_mode": "interactive",
+            })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                *[{"id": name, "type": "agent", "agent_id": name} for name in ("left", "right", "join")],
+                {"id": "review", "type": "review"},
+            ],
+            "edges": [
+                {"source": "start", "target": "left"},
+                {"source": "start", "target": "right"},
+                {"source": "left", "target": "review"},
+                {"source": "review", "target": "join"},
+                {"source": "right", "target": "join"},
+            ],
+        }
+        service.store.save_workflow_config({"id": "review-parallel", "name": "Review", "config": json.dumps(graph)})
+        session_id, _ = await service.open_conversation(None, workflow_id="review-parallel")
+        await service.send_message(session_id, "Request", "left")
+        await asyncio.gather(*service._tasks)
+        await service.submit_for_review(session_id, "left result", "left")
+        self.assertEqual(service.get_workflow(session_id)["stage"], "agent2")
+        await service.submit_for_review(session_id, "right result", "right")
+        self.assertEqual(service.get_workflow(session_id)["stage"], "review")
+        self.assertEqual(service.get_workflow(session_id)["artifact_content"], "Reply to: left result")
+        await service.approve_result(session_id)
+        await asyncio.gather(*service._tasks)
+        join = service.get_workflow(session_id, "join")
+        self.assertEqual(join["agent_status"], "waiting")
+        instructions = client.created_messages[-1]["system_message"]["content"]
+        self.assertIn("Reply to: left result", instructions)
+        self.assertIn("Reply to: right result", instructions)
+
     async def test_only_connected_constant_files_are_injected_and_recorded(self) -> None:
         client = FakeClient()
         service = self.track(CopilotAgentService())
@@ -272,6 +506,270 @@ class AgentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["stage"], "review")
         self.assertEqual(result["artifact_content"], "Reply to: Please provide your final answer")
         self.assertIn("Please provide your final answer", client.session.messages)
+
+    async def test_interactive_finalization_uses_configured_result_prompt(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "default",
+            "name": "Agent 1",
+            "instructions": "Role",
+            "expected_result": "Return a concise project brief.",
+            "interaction_mode": "interactive",
+        })
+        session_id, _ = await service.open_conversation(None)
+        self.assertIn(
+            "Interactive mode",
+            client.created_messages[0]["system_message"]["content"],
+        )
+
+        await service.send_message(session_id, "Help me plan a project")
+        discussion = service.get_workflow(session_id)
+        self.assertEqual(discussion["stage"], "agent1")
+        self.assertFalse(discussion["artifact_ready"])
+
+        result = await service.submit_for_review(session_id, "Ignore the saved prompt")
+        self.assertEqual(result["stage"], "review")
+        self.assertEqual(
+            client.session.messages[-1], "Return a concise project brief."
+        )
+        history = service._conversations[session_id].messages
+        self.assertEqual(history[-2].role, "instruction")
+        self.assertEqual(history[-2].content, "Return a concise project brief.")
+
+    async def test_interactive_result_goes_directly_to_next_configured_agent(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "next-agent",
+            "name": "Next agent",
+            "instructions": "Turn the brief into an action plan.",
+            "expected_result": "Return three actions.",
+            "interaction_mode": "autonomous",
+        })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "first", "type": "agent", "agent_id": "default"},
+                {"id": "next", "type": "agent", "agent_id": "next-agent"},
+            ],
+            "edges": [
+                {"source": "start", "target": "first"},
+                {"source": "first", "target": "next"},
+            ],
+        }
+        service.store.save_workflow_config({
+            "id": "direct", "name": "Direct", "config": json.dumps(graph),
+        })
+        session_id, _ = await service.open_conversation(
+            None, workflow_id="direct"
+        )
+
+        await service.send_message(session_id, "Create a brief")
+        result = await service.submit_for_review(session_id, "Return a brief.")
+        await asyncio.gather(*service._tasks)
+
+        self.assertEqual(result["stage"], "agent2")
+        self.assertEqual(service.get_workflow(session_id)["stage"], "complete")
+        self.assertTrue(client.created_messages[1]["system_message"]["content"].startswith(
+            "Turn the brief into an action plan."
+        ))
+        self.assertNotIn("Create a brief", client.sessions["session-2"].messages[0])
+        self.assertIn("Return three actions.", client.sessions["session-2"].messages[0])
+        self.assertIn(
+            "Reply to: Return a brief.",
+            client.created_messages[1]["system_message"]["content"],
+        )
+
+    async def test_linear_workflow_passes_all_connected_inputs_to_each_agent(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "next-agent",
+            "name": "Next agent",
+            "instructions": "Use the connected information.",
+            "expected_result": "Return a summary.",
+        })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "first", "type": "agent", "agent_id": "default", "label": "Research"},
+                {"id": "second", "type": "agent", "agent_id": "next-agent", "label": "Summarize"},
+                {"id": "source-a", "type": "data_source", "source_type": "manual", "label": "Brief", "output": "Project brief"},
+                {"id": "source-b", "type": "data_source", "source_type": "manual", "label": "Constraints", "output": "Under budget"},
+            ],
+            "edges": [
+                {"source": "start", "target": "first"},
+                {"source": "first", "target": "second"},
+                {"source": "source-a", "target": "second"},
+                {"source": "source-b", "target": "second"},
+            ],
+        }
+        service.store.save_workflow_config({
+            "id": "linear", "name": "Linear", "config": json.dumps(graph),
+        })
+        session_id, _ = await service.open_conversation(None, workflow_id="linear")
+
+        await service.send_message(session_id, "Create a summary")
+        result = await service.submit_for_review(session_id, "Return the research.")
+        self.assertEqual(result["stage"], "agent2")
+        await asyncio.gather(*service._tasks)
+
+        active = service.get_workflow(session_id)
+        next_agent_instructions = client.created_messages[1]["system_message"]["content"]
+        self.assertEqual(active["active_node_id"], "second")
+        self.assertEqual(active["active_agent_name"], "Next agent")
+        self.assertIn("Project brief", next_agent_instructions)
+        self.assertIn("Under budget", next_agent_instructions)
+        self.assertIn("Reply to: Return the research.", next_agent_instructions)
+        self.assertEqual(active["messages"][-1]["role"], "assistant")
+
+        await service.finalize_result(session_id)
+        self.assertEqual(service.get_workflow(session_id)["stage"], "complete")
+
+    async def test_downstream_agents_receive_original_request_only_from_connected_chat(self) -> None:
+        for mode in ("interactive", "autonomous"):
+            for connect_chat in (False, True):
+                with self.subTest(mode=mode, connect_chat=connect_chat):
+                    client = FakeClient()
+                    service = self.track(CopilotAgentService())
+                    service._client = client
+                    for agent_id, interaction_mode in (("second", "interactive"), ("third", mode)):
+                        service.store.save_agent_config({
+                            "id": agent_id,
+                            "name": agent_id,
+                            "instructions": f"Instructions for {agent_id}",
+                            "expected_result": f"Result for {agent_id}" if agent_id == "third" else "",
+                            "interaction_mode": interaction_mode,
+                        })
+                    graph = {
+                        "nodes": [
+                            {"id": "start", "type": "start"},
+                            {"id": "first", "type": "agent", "agent_id": "default"},
+                            {"id": "second", "type": "agent", "agent_id": "second"},
+                            {"id": "third", "type": "agent", "agent_id": "third"},
+                            {"id": "chat", "type": "data_source", "source_type": "chat"},
+                            {"id": "reference", "type": "data_source", "source_type": "manual", "output": "Selected reference"},
+                            {"id": "unconnected", "type": "data_source", "source_type": "manual", "output": "Unselected reference"},
+                        ],
+                        "edges": [
+                            {"source": "start", "target": "first"},
+                            {"source": "first", "target": "second"},
+                            {"source": "second", "target": "third"},
+                            {"source": "reference", "target": "third"},
+                            *([{"source": "chat", "target": "third"}] if connect_chat else []),
+                        ],
+                    }
+                    service.store.save_workflow_config({
+                        "id": "three-agents", "name": "Three agents", "config": json.dumps(graph),
+                    })
+                    session_id, _ = await service.open_conversation(None, workflow_id="three-agents")
+                    await service.send_message(session_id, "Original private request")
+                    await service.submit_for_review(session_id, "First result")
+                    await asyncio.gather(*service._tasks)
+                    await service.submit_for_review(session_id, "Second result")
+                    await asyncio.gather(*service._tasks)
+
+                    second_system = client.created_messages[1]["system_message"]["content"]
+                    second_prompt = client.sessions["session-2"].messages[0]
+                    third_system = client.created_messages[2]["system_message"]["content"]
+                    third_prompt = client.sessions["session-3"].messages[0]
+                    self.assertNotIn("Original private request", second_system + second_prompt)
+                    self.assertIn("Reply to: Second result", third_system)
+                    self.assertIn("Selected reference", third_system)
+                    self.assertNotIn("Unselected reference", third_system + third_prompt)
+                    self.assertNotIn("First result", third_system + third_prompt)
+                    self.assertNotIn("Original private request", third_prompt)
+                    if connect_chat:
+                        self.assertIn("Original private request", third_system)
+                    else:
+                        self.assertNotIn("Original private request", third_system)
+                    if mode == "autonomous":
+                        self.assertIn("Result for third", third_prompt)
+
+    async def test_interactive_result_waits_for_configured_review(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "next-agent",
+            "name": "Next agent",
+            "instructions": "Create an action plan.",
+            "expected_result": "Return an action plan.",
+            "interaction_mode": "autonomous",
+        })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "first", "type": "agent", "agent_id": "default"},
+                {"id": "review", "type": "review"},
+                {"id": "next", "type": "agent", "agent_id": "next-agent"},
+            ],
+            "edges": [
+                {"source": "start", "target": "first"},
+                {"source": "first", "target": "review"},
+                {"source": "review", "target": "next"},
+            ],
+        }
+        service.store.save_workflow_config({
+            "id": "reviewed", "name": "Reviewed", "config": json.dumps(graph),
+        })
+        session_id, _ = await service.open_conversation(
+            None, workflow_id="reviewed"
+        )
+
+        await service.send_message(session_id, "Create a brief")
+        result = await service.submit_for_review(session_id, "Return a brief.")
+        self.assertEqual(result["stage"], "review")
+
+        await service.approve_result(session_id)
+        await asyncio.gather(*service._tasks)
+
+        self.assertEqual(service.get_workflow(session_id)["stage"], "complete")
+        self.assertTrue(client.created_messages[1]["system_message"]["content"].startswith(
+            "Create an action plan."
+        ))
+        self.assertIn(
+            "Reply to: Return a brief.",
+            client.created_messages[1]["system_message"]["content"],
+        )
+
+    async def test_autonomous_agent_completes_from_initial_request(self) -> None:
+        client = FakeClient()
+        service = self.track(CopilotAgentService())
+        service._client = client
+        service.store.save_agent_config({
+            "id": "default",
+            "name": "Agent 1",
+            "instructions": "Role",
+            "expected_result": "Return a concise answer.",
+            "interaction_mode": "autonomous",
+        })
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "agent", "type": "agent", "agent_id": "default"},
+            ],
+            "edges": [{"source": "start", "target": "agent"}],
+        }
+        service.store.save_workflow_config({
+            "id": "single", "name": "Single", "config": json.dumps(graph),
+        })
+        session_id, _ = await service.open_conversation(
+            None, workflow_id="single"
+        )
+
+        await service.send_message(session_id, "Summarize this project")
+
+        self.assertIn("Return a concise answer.", client.session.messages[0])
+        self.assertEqual(service.get_workflow(session_id)["stage"], "complete")
+        self.assertEqual(
+            service.get_workflow(session_id)["output"],
+            f"Reply to: {client.session.messages[0]}",
+        )
 
     async def test_submit_for_review_cannot_proceed_during_agent_response(self) -> None:
         client = FakeClient()

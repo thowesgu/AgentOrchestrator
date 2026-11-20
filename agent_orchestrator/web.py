@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -27,6 +27,102 @@ from agent_orchestrator.storage import (
 )
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+WORKFLOW_NODE_TYPES = frozenset({"start", "agent", "data_source", "review"})
+
+
+def _validate_workflow_config(config: str) -> None:
+    try:
+        graph = json.loads(config)
+    except json.JSONDecodeError as error:
+        raise ValueError("Workflow config must be valid JSON.") from error
+    if (
+        not isinstance(graph, dict)
+        or not isinstance(graph.get("nodes"), list)
+        or not isinstance(graph.get("edges"), list)
+    ):
+        raise ValueError("Workflow config must contain nodes and edges.")
+
+    nodes = graph["nodes"]
+    edges = graph["edges"]
+    ids: set[str] = set()
+    starts: list[str] = []
+    node_types: dict[str, str] = {}
+    for node in nodes:
+        if (
+            not isinstance(node, dict)
+            or not isinstance(node.get("id"), str)
+            or not node["id"]
+            or node["id"] in ids
+            or not isinstance(node.get("type"), str)
+            or node["type"] not in WORKFLOW_NODE_TYPES
+        ):
+            raise ValueError("Workflow contains an unsupported node or duplicate node ID.")
+        ids.add(node["id"])
+        node_types[node["id"]] = node["type"]
+        if node["type"] == "start":
+            starts.append(node["id"])
+
+    if len(starts) != 1:
+        raise ValueError("A workflow must contain exactly one Start node.")
+
+    adjacency = {node_id: [] for node_id in ids}
+    incoming = dict.fromkeys(ids, 0)
+    incoming_sources: dict[str, list[str]] = {node_id: [] for node_id in ids}
+    for edge in edges:
+        if (
+            not isinstance(edge, dict)
+            or not isinstance(edge.get("source"), str)
+            or not isinstance(edge.get("target"), str)
+            or edge.get("source") not in ids
+            or edge.get("target") not in ids
+        ):
+            raise ValueError("Every connection must join two existing nodes.")
+        if node_types[edge["target"]] in {"start", "data_source"}:
+            raise ValueError("Start and data source nodes cannot have incoming connections.")
+        adjacency[edge["source"]].append(edge["target"])
+        incoming[edge["target"]] += 1
+        incoming_sources[edge["target"]].append(edge["source"])
+
+    for node in nodes:
+        if node["type"] != "review":
+            continue
+        sources = incoming_sources[node["id"]]
+        if len(sources) != 1:
+            raise ValueError("Every review node must have exactly one incoming connection.")
+        if node_types[sources[0]] != "agent":
+            raise ValueError("A review node must receive its input from an agent.")
+
+    start_id = starts[0]
+    if incoming[start_id]:
+        raise ValueError("The Start node cannot have an incoming connection.")
+    if not adjacency[start_id]:
+        raise ValueError("Connect the Start node to at least one step.")
+
+    data_source_ids = {
+        node["id"] for node in nodes if node["type"] == "data_source"
+    }
+    reachable = {start_id, *data_source_ids}
+    pending = list(reachable)
+    while pending:
+        for target in adjacency[pending.pop()]:
+            if target not in reachable:
+                reachable.add(target)
+                pending.append(target)
+    if reachable != ids:
+        raise ValueError("Connect every node to Start; all nodes must be reachable.")
+
+    remaining_incoming = dict(incoming)
+    ready = [node_id for node_id, count in incoming.items() if count == 0]
+    visited = 0
+    while ready:
+        source = ready.pop()
+        visited += 1
+        for target in adjacency[source]:
+            remaining_incoming[target] -= 1
+            if remaining_incoming[target] == 0:
+                ready.append(target)
+    if visited != len(ids):
+        raise ValueError("Workflow connections cannot contain a cycle.")
 
 
 class StartSessionRequest(BaseModel):
@@ -38,23 +134,33 @@ class StartSessionRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: Annotated[str, Field(min_length=1, max_length=20_000)]
+    node_id: str | None = None
 
 
 class SubmitForReviewRequest(BaseModel):
     prompt: Annotated[str, Field(min_length=1, max_length=20_000)]
+    node_id: str | None = None
+
+
+class FinalizeLastRequest(BaseModel):
+    node_id: str | None = None
 
 
 class AgentConfigRequest(BaseModel):
     name: Annotated[str, Field(min_length=1, max_length=200)]
     instructions: Annotated[str, Field(min_length=1, max_length=50_000)]
     expected_result: Annotated[str, Field(default="", max_length=50_000)]
+    interaction_mode: Literal["interactive", "autonomous"] = "interactive"
 
     @model_validator(mode="after")
     def validate(self) -> "AgentConfigRequest":
         self.name = self.name.strip()
         self.instructions = self.instructions.strip()
+        self.expected_result = self.expected_result.strip()
         if not self.name or not self.instructions:
             raise ValueError("Name and instructions are required.")
+        if self.interaction_mode == "autonomous" and not self.expected_result:
+            raise ValueError("An expected result is required for autonomous agents.")
         return self
 
 
@@ -73,6 +179,7 @@ class WorkflowConfigRequest(BaseModel):
             raise ValueError("Name and config are required.")
         if len(self.config) > 100_000:
             raise ValueError("Config must not exceed 100000 characters.")
+        _validate_workflow_config(self.config)
         return self
 
 
@@ -178,7 +285,11 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
         if not content:
             raise HTTPException(status_code=422, detail="Message cannot be empty.")
         try:
-            messages = await service.send_message(session_id, content)
+            messages = (
+                await service.send_message(session_id, content, request.node_id)
+                if request.node_id
+                else await service.send_message(session_id, content)
+            )
         except KeyError as error:
             raise HTTPException(
                 status_code=404, detail="This conversation is no longer available."
@@ -189,13 +300,20 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {
             "messages": [asdict(message) for message in messages],
-            "workflow": service.get_workflow(session_id),
+            "workflow": (
+                service.get_workflow(session_id, request.node_id)
+                if request.node_id
+                else service.get_workflow(session_id)
+            ),
         }
 
     @application.get("/api/sessions/{session_id}/workflow")
-    async def get_workflow(session_id: str) -> dict[str, object]:
+    async def get_workflow(session_id: str, node_id: str | None = None) -> dict[str, object]:
         try:
-            return service.get_workflow(session_id)
+            return (
+                service.get_workflow(session_id, node_id)
+                if node_id else service.get_workflow(session_id)
+            )
         except KeyError as error:
             raise HTTPException(
                 status_code=404, detail="This workflow is no longer available."
@@ -204,11 +322,36 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
     @application.post("/api/sessions/{session_id}/finalize")
     async def submit_for_review(session_id: str, request: SubmitForReviewRequest) -> dict[str, object]:
         try:
-            return await service.submit_for_review(session_id, request.prompt.strip())
+            return (
+                await service.submit_for_review(
+                    session_id, request.prompt.strip(), request.node_id
+                )
+                if request.node_id
+                else await service.submit_for_review(session_id, request.prompt.strip())
+            )
         except KeyError as error:
             raise HTTPException(
                 status_code=404, detail="This workflow is no longer available."
             ) from error
+        except AgentUnavailableError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        except WorkflowTransitionError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @application.post("/api/sessions/{session_id}/finalize-last")
+    async def finalize_last(session_id: str, request: FinalizeLastRequest) -> dict[str, object]:
+        try:
+            return (
+                await service.finalize_result(session_id, request.node_id)
+                if request.node_id
+                else await service.finalize_result(session_id)
+            )
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404, detail="This workflow is no longer available."
+            ) from error
+        except AgentUnavailableError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
         except WorkflowTransitionError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -261,6 +404,7 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
             "name": request.name,
             "instructions": request.instructions,
             "expected_result": request.expected_result,
+            "interaction_mode": request.interaction_mode,
         })
         return service.store.agent_config(config_id)
 
@@ -273,6 +417,7 @@ def create_app(agent: CopilotAgentService | None = None) -> FastAPI:
             "name": request.name,
             "instructions": request.instructions,
             "expected_result": request.expected_result,
+            "interaction_mode": request.interaction_mode,
         })
         return service.store.agent_config(config_id)
 

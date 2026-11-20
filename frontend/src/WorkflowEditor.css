@@ -39,7 +39,8 @@
   border-radius: 6px;
   font: inherit;
 }
-.workflow-editor-error { padding: 12px 24px; background: #fee; color: #a22; }
+.workflow-editor-error { padding: 12px 24px; background: #fee; color: #a22; white-space: pre-line; }
+.workflow-editor-success { padding: 12px 24px; background: #e7f3e9; color: #285d36; }
 .workflow-editor-body { display: flex; flex: 1; min-height: 0; }
 .workflow-editor-palette, .workflow-editor-details {
   width: 220px;
@@ -55,6 +56,11 @@
 .workflow-editor-palette p, .workflow-editor-details p { color: #64746a; font-size: 13px; line-height: 1.5; }
 .workflow-editor-details label { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; font-size: 13px; }
 .workflow-editor-details fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.workflow-agent-inputs { margin: 0 0 16px; padding: 10px; border: 1px solid #dfe5dc; border-radius: 7px; background: #f7faf6; font-size: 12px; line-height: 1.5; }
+.workflow-agent-inputs strong { display: block; margin-bottom: 6px; }
+.workflow-agent-inputs ul { margin: 0; padding-left: 18px; }
+.workflow-agent-inputs span, .workflow-agent-inputs p { color: #64746a; font-size: 11px; }
+.workflow-agent-inputs p { margin: 0; }
 .workflow-editor-canvas { flex: 1; min-width: 0; background: #fafbf9; }
 .constant-file-library { margin-top: 24px; padding-top: 16px; border-top: 1px solid #e1e5df; }
 .constant-file-upload, .constant-file-replace {

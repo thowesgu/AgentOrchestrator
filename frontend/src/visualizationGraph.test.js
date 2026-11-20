@@ -34,3 +34,19 @@ test("legacy nodes without positions do not overlap at the origin", () => {
   });
   assert.equal(new Set(graph.nodes.map((node) => JSON.stringify(node.position))).size, 3);
 });
+
+test("visualization marks the active and completed workflow steps", () => {
+  const graph = visualizationGraph({
+    nodes: [
+      { id: "agent-1", type: "agent", label: "Research" },
+      { id: "agent-2", type: "agent", label: "Summarize" },
+    ],
+    edges: [{ source: "agent-1", target: "agent-2" }],
+    active_node_id: "agent-2",
+    node_statuses: { "agent-1": "completed", "agent-2": "active" },
+  });
+
+  assert.equal(graph.nodes[0].data.label, "Research · Completed");
+  assert.equal(graph.nodes[1].data.label, "Summarize · Active");
+  assert.equal(graph.nodes[1].style.borderColor, "#d09541");
+});

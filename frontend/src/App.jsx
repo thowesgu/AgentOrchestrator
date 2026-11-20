@@ -39,10 +39,10 @@ export default function App() {
   const [workflowId, setWorkflowId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [workflow, setWorkflow] = useState(null);
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [draft, setDraft] = useState("");
   const [finalizationPrompt, setFinalizationPrompt] = useState("");
-  const [showFinalizationPrompt, setShowFinalizationPrompt] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [pendingMessages, setPendingMessages] = useState([]);
   const [starting, setStarting] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState("");
@@ -52,8 +52,12 @@ export default function App() {
   const [editingWorkflowId, setEditingWorkflowId] = useState(null);
   const endOfMessages = useRef(null);
   const activeSessionRef = useRef(null);
-  const sessionIsRunning = sessions.some((saved) => saved.id === sessionId && saved.status === "running");
-  const sessionProcessing = sessionIsRunning || (loading && activeSessionRef.current === sessionId);
+  const selectedNodeRef = useRef(null);
+  const sessionProcessing = Boolean(
+    workflow?.agent_status === "running"
+    || pendingMessages.includes(`${sessionId}:${selectedNodeId || ""}`),
+  );
+  const runtimeUnavailable = workflow?.agent_status === "unavailable";
   const isTerminal = workflow?.stage === "complete"
     || workflow?.stage === "discarded"
     || workflow?.stage === "agent2_error";
@@ -66,7 +70,9 @@ export default function App() {
       setSessions(savedSessions);
       setAgentConfigs(configs);
       setWorkflowConfigs(workflows);
-      setSelectedWorkflowId((current) => current || workflows[0]?.id || "");
+      setSelectedWorkflowId((current) => (
+        workflows.some((item) => item.id === current) ? current : workflows[0]?.id || ""
+      ));
     } catch (failure) {
       setError(failure.message);
     }
@@ -83,19 +89,24 @@ export default function App() {
   }, [messages]);
 
   useEffect(() => {
-    if (!sessionId || workflow?.stage !== "agent2") return undefined;
+    if (!sessionId || isTerminal) return undefined;
     let cancelled = false;
     let timer;
     async function refreshWorkflow() {
       try {
         const current = await request(
-          `/api/sessions/${encodeURIComponent(sessionId)}/workflow`,
+          `/api/sessions/${encodeURIComponent(sessionId)}/workflow${selectedNodeId ? `?node_id=${encodeURIComponent(selectedNodeId)}` : ""}`,
         );
         if (cancelled) return;
         setWorkflow(current);
-        if (current.stage === "agent2") {
-          timer = setTimeout(refreshWorkflow, 900);
+        if (Array.isArray(current.messages)) {
+          setMessages((previous) => (
+            JSON.stringify(previous) === JSON.stringify(current.messages)
+              ? previous : current.messages
+          ));
         }
+        setFinalizationPrompt(current.expected_result || "");
+        timer = setTimeout(refreshWorkflow, 900);
       } catch (failure) {
         if (!cancelled) setError(failure.message);
       }
@@ -105,27 +116,62 @@ export default function App() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [sessionId, workflow?.stage]);
+  }, [sessionId, selectedNodeId, isTerminal]);
+
+  useEffect(() => {
+    if (!sessionId || !["agent1", "agent2"].includes(workflow?.stage)) return;
+    const active = workflow.active_node_ids || [];
+    if (active.length && !active.includes(selectedNodeId)) {
+      const next = active.includes(workflow.active_node_id) ? workflow.active_node_id : active[0];
+      selectedNodeRef.current = next;
+      setSelectedNodeId(next);
+    }
+  }, [sessionId, selectedNodeId, workflow]);
 
   async function selectSession(saved) {
     activeSessionRef.current = saved.id;
     setSessionId(saved.id);
+    selectedNodeRef.current = null;
+    setSelectedNodeId(null);
     setEditingConfigId(null);
     setMessages(saved.messages || []);
-    const config = agentConfigs.find(c => c.id === saved.agent_id);
-    if (config?.expected_result) {
-      setFinalizationPrompt(config.expected_result);
-    }
+    setFinalizationPrompt(saved.expected_result || "");
     setWorkflow({
       stage: saved.stage, artifact_ready: false, artifact_content: null,
       output: saved.output || "", error: saved.error || "",
+      interaction_mode: saved.interaction_mode || "interactive",
+      expected_result: saved.expected_result || "",
     });
     setError(saved.error || "");
     try {
       const current = await request(`/api/sessions/${encodeURIComponent(saved.id)}/workflow`);
-      if (activeSessionRef.current === saved.id) setWorkflow(current);
+      if (activeSessionRef.current === saved.id) {
+        setWorkflow(current);
+        setMessages(current.messages || []);
+        setFinalizationPrompt(current.expected_result || "");
+      }
     } catch (failure) {
       if (activeSessionRef.current === saved.id) setError(failure.message);
+    }
+
+  }
+
+  async function selectWorkflowNode(nodeId) {
+    const node = workflow?.nodes?.find((item) => item.id === nodeId);
+    if (!node || node.type !== "agent" || !workflow.active_node_ids?.includes(nodeId)) return;
+    selectedNodeRef.current = nodeId;
+    setSelectedNodeId(nodeId);
+    try {
+      const current = await request(
+        `/api/sessions/${encodeURIComponent(sessionId)}/workflow?node_id=${encodeURIComponent(nodeId)}`,
+      );
+      if (activeSessionRef.current === sessionId && selectedNodeRef.current === nodeId) {
+        setWorkflow(current);
+        setMessages(current.messages || []);
+        setFinalizationPrompt(current.expected_result || "");
+      }
+    } catch (failure) {
+      setError(failure.message);
     }
   }
 
@@ -136,7 +182,7 @@ export default function App() {
       if (sessionId === saved.id) goHome();
       await refreshLists();
     } catch (failure) {
-      setAgentError(failure.message);
+      setError(failure.message);
     }
   }
 
@@ -147,21 +193,11 @@ export default function App() {
     setStarting(true);
     setError("");
     let createdSessionId = null;
+    let requestKey = null;
     try {
-      const selectedWorkflow = workflowConfigs.find((item) => item.id === selectedWorkflowId);
-      let configId = "default";
-      if (selectedWorkflow) {
-        const savedConfig = typeof selectedWorkflow.config === "string"
-          ? JSON.parse(selectedWorkflow.config)
-          : selectedWorkflow.config;
-        const activeAgent = savedConfig.nodes?.find(
-          (node) => node.type === "agent" && typeof node.agent_id === "string" && node.agent_id,
-        );
-        if (activeAgent) configId = activeAgent.agent_id;
-      }
       const result = await request("/api/sessions", {
         method: "POST",
-        body: JSON.stringify({ config_id: configId, prompt: content, workflow_id: selectedWorkflowId }),
+        body: JSON.stringify({ workflow_id: selectedWorkflowId }),
       });
       createdSessionId = result.session_id;
       activeSessionRef.current = result.session_id;
@@ -169,9 +205,25 @@ export default function App() {
       setWorkflowId(selectedWorkflowId);
       setMessages(result.messages);
       setWorkflow(result.workflow);
+      const initialNodeId = result.workflow.active_node_id || null;
+      selectedNodeRef.current = initialNodeId;
+      setSelectedNodeId(initialNodeId);
+      setFinalizationPrompt(result.workflow.expected_result || "");
       setSessionPrompt("");
-      setLoading(false);
       void refreshLists();
+      requestKey = `${result.session_id}:${initialNodeId || ""}`;
+      setPendingMessages((current) => [...current, requestKey]);
+      const firstStep = await request(
+        `/api/sessions/${encodeURIComponent(result.session_id)}/messages`,
+        { method: "POST", body: JSON.stringify({ content, node_id: initialNodeId || undefined }) },
+      );
+      if (activeSessionRef.current === result.session_id) {
+        if (selectedNodeRef.current === initialNodeId) {
+          setMessages(firstStep.messages);
+          setWorkflow(firstStep.workflow);
+        }
+        setError(firstStep.workflow.error || "");
+      }
     } catch (failure) {
       if (createdSessionId && activeSessionRef.current === createdSessionId) {
         setError(failure.message);
@@ -180,7 +232,9 @@ export default function App() {
       }
     } finally {
       setStarting(false);
-      setLoading(false);
+      if (requestKey) {
+        setPendingMessages((current) => current.filter((key) => key !== requestKey));
+      }
     }
   }
 
@@ -188,24 +242,25 @@ export default function App() {
     event.preventDefault();
     const content = draft.trim();
     const activeId = sessionId;
-    if (!content || !sessionId || loading || workflow?.stage !== "agent1") return;
+    if (!content || !sessionId || sessionProcessing || !["agent1", "agent2"].includes(workflow?.stage)) return;
 
     setDraft("");
     setError("");
-    setLoading(true);
+    const requestKey = `${activeId}:${selectedNodeId || ""}`;
+    setPendingMessages((current) => [...current, requestKey]);
     try {
       const result = await request(
         `/api/sessions/${encodeURIComponent(activeId)}/messages`,
-        { method: "POST", body: JSON.stringify({ content }) },
+        { method: "POST", body: JSON.stringify({ content, node_id: selectedNodeId || undefined }) },
       );
-      if (activeSessionRef.current === activeId) {
+      if (activeSessionRef.current === activeId && selectedNodeRef.current === selectedNodeId) {
         setMessages(result.messages);
         setWorkflow(result.workflow);
         setError(result.workflow.error || "");
       }
     } catch (failure) {
       if (activeSessionRef.current === activeId) setError(failure.message);
-      if (activeSessionRef.current === activeId) {
+      if (activeSessionRef.current === activeId && selectedNodeRef.current === selectedNodeId) {
         setMessages((current) => [
           ...current,
           { role: "user", content, status: "failed" },
@@ -216,28 +271,33 @@ export default function App() {
         setSessionId(null);
       }
     } finally {
-      setLoading(false);
+      setPendingMessages((current) => current.filter((key) => key !== requestKey));
     }
   }
 
   async function runAction(action, payload = null) {
     if (!sessionId || actionLoading) return;
+    const activeId = sessionId;
+    const nodeId = selectedNodeId;
     setActionLoading(true);
     setError("");
     try {
       const options = { method: "POST" };
       if (payload) {
-        options.body = JSON.stringify(payload);
+        options.body = JSON.stringify({
+          ...payload,
+          ...(["finalize", "finalize-last"].includes(action) && nodeId ? { node_id: nodeId } : {}),
+        });
       }
       const result = await request(
         `/api/sessions/${encodeURIComponent(sessionId)}/${action}`,
         options,
       );
-      setWorkflow(result);
-      setError(result.error || "");
-      if (action === "finalize") {
-        setShowFinalizationPrompt(false);
-        setFinalizationPrompt("");
+      if (activeSessionRef.current === activeId
+          && (!["finalize", "finalize-last"].includes(action) || selectedNodeRef.current === nodeId)) {
+        setWorkflow(result);
+        setError(result.error || "");
+        setFinalizationPrompt(result.expected_result || "");
       }
     } catch (failure) {
       setError(failure.message);
@@ -250,18 +310,21 @@ export default function App() {
     activeSessionRef.current = null;
     setSessionId(null);
     setWorkflowId(null);
+    selectedNodeRef.current = null;
+    setSelectedNodeId(null);
     setMessages([]);
     setWorkflow(null);
     setDraft("");
     setFinalizationPrompt("");
-    setShowFinalizationPrompt(false);
     setError("");
     setEditingConfigId(null);
   }
 
   const stage = workflow?.stage || "agent1";
-  const chatVisible = stage === "agent1";
+  const interactiveMode = workflow?.interaction_mode !== "autonomous";
+  const chatVisible = ["agent1", "agent2"].includes(stage) && interactiveMode;
   const reviewVisible = stage === "review";
+  const agentName = workflow?.active_agent_name || "Agent";
   const latestMessage = messages[messages.length - 1];
   const canUseLastAnswer = messages.length >= 3
     && latestMessage?.role === "assistant"
@@ -282,8 +345,8 @@ export default function App() {
           <span className="brand-mark small" aria-hidden="true">✳</span> Copilot
         </a>
         <div className="online-indicator">
-          <span className={stage === "complete" ? "status-dot complete-dot" : ""} />
-          {stage === "complete" ? "Workflow complete" : "Workflow in progress"}
+          <span className={["complete", "discarded", "agent2_error"].includes(stage) ? "status-dot complete-dot" : ""} />
+          {stage === "complete" ? "Workflow complete" : stage === "discarded" ? "Workflow discarded" : stage === "agent2_error" ? "Workflow failed" : "Workflow in progress"}
         </div>
       </header>
       <div className="workflow-layout">
@@ -294,14 +357,14 @@ export default function App() {
           </div>
           <div className="sidebar-section-heading">
             <span>AGENT CONFIGS</span>
-            <button className="icon-button" aria-label="Create agent config" onClick={() => setEditingConfigId("new")}>+</button>
+            <button className="icon-button" aria-label="Create agent config" onClick={() => { setEditingWorkflowId(null); setEditingConfigId("new"); }}>+</button>
           </div>
           <div className="config-list">
             {agentConfigs.map((config) => (
               <button
                 key={config.id}
                 className={`config-row ${editingConfigId === config.id ? "selected" : ""}`}
-                onClick={() => setEditingConfigId(config.id)}
+                onClick={() => { setEditingWorkflowId(null); setEditingConfigId(config.id); }}
               >
                 <span className="config-name">{config.name}</span>
               </button>
@@ -309,14 +372,14 @@ export default function App() {
           </div>
           <div className="sidebar-section-heading">
             <span>WORKFLOW CONFIGS</span>
-            <button className="icon-button" aria-label="Create workflow config" onClick={() => setEditingWorkflowId("new")}>+</button>
+            <button className="icon-button" aria-label="Create workflow config" onClick={() => { setEditingConfigId(null); setEditingWorkflowId("new"); }}>+</button>
           </div>
           <div className="config-list">
             {workflowConfigs.map((config) => (
               <button
                 key={config.id}
                 className={`config-row ${editingWorkflowId === config.id ? "selected" : ""}`}
-                onClick={() => setEditingWorkflowId(config.id)}
+                onClick={() => { setEditingConfigId(null); setEditingWorkflowId(config.id); }}
               >
                 <span className="config-name">{config.name}</span>
               </button>
@@ -364,7 +427,7 @@ export default function App() {
               }}
             />
           )}
-          {!editingConfigId && !sessionId && (
+          {!editingConfigId && !editingWorkflowId && !sessionId && (
             <section className="new-session-panel">
               <div className="brand-mark" aria-hidden="true">✳</div>
               <p className="eyebrow">COPILOT WORKFLOW</p>
@@ -385,16 +448,16 @@ export default function App() {
               <p className="footnote">The release-gated Agent 1 → review → Agent 2 workflow is unchanged.</p>
             </section>
           )}
-          {sessionId && <>
+          {sessionId && !editingConfigId && !editingWorkflowId && <>
           {chatVisible && (
-            <section className="conversation" aria-label="Conversation with Agent 1">
+            <section className="conversation" aria-label={`Conversation with ${agentName}`}>
               <div className="conversation-heading">
-                <p className="eyebrow">AGENT 1 · ACTIVE</p>
-                <h1>What should we work on?</h1>
+                <p className="eyebrow">{agentName.toUpperCase()} · ACTIVE</p>
+                <h1>{stage === "agent1" ? "What should we work on?" : `Continue with ${agentName}`}</h1>
               </div>
               {workflow?.constant_files?.length > 0 && (
-                <aside className="session-constant-files" aria-label="Constant files provided to Agent 1">
-                  <strong>Constant files provided to Agent 1</strong>
+                <aside className="session-constant-files" aria-label={`Constant files provided to ${agentName}`}>
+                  <strong>Connected files provided to {agentName}</strong>
                   <ul>{workflow.constant_files.map((file) => <li key={file.id}>{file.filename}</li>)}</ul>
                 </aside>
               )}
@@ -406,7 +469,7 @@ export default function App() {
                   >
                     {message.role === "assistant" && <span className="message-avatar" aria-hidden="true">✳</span>}
                     <div className="message-content">
-                      <p className="speaker">{message.role === "user" ? "You" : "Agent 1"}</p>
+                      <p className="speaker">{message.role === "user" ? "You" : message.role === "instruction" ? "Configured result" : message.role === "context" ? "Connected workflow context" : agentName}</p>
                       <p className="message-text">{message.content}</p>
                       {message.status === "failed" && <p className="message-status">Not sent — please try again.</p>}
                     </div>
@@ -416,7 +479,7 @@ export default function App() {
                   <article className="message from-agent" aria-label="Agent 1 is replying">
                     <span className="message-avatar" aria-hidden="true">✳</span>
                     <div className="message-content">
-                      <p className="speaker">Agent 1</p>
+                      <p className="speaker">{agentName}</p>
                       <p className="typing-indicator"><span /><span /><span /></p>
                     </div>
                   </article>
@@ -424,43 +487,36 @@ export default function App() {
                 <div ref={endOfMessages} />
               </div>
               {error && <p className="alert inline-alert" role="alert">{error}</p>}
-              <div className="conversation-actions">
-                {!showFinalizationPrompt ? (
-                  <>
-                    <p>Get a final answer from Agent 1 to review.</p>
-                    <button
-                      className="secondary-button"
-                      onClick={() => setShowFinalizationPrompt(true)}
-                      disabled={actionLoading || sessionProcessing}
-                    >
-                      Request final answer
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <div className="finalization-container">
-                      <label>Expected result:</label>
-                      <p className="finalization-preview">{finalizationPrompt || "No expected result defined"}</p>
-                    </div>
-                    <div className="prompt-actions">
-                      <button
-                        className="secondary-button"
-                        onClick={() => setShowFinalizationPrompt(false)}
-                        disabled={actionLoading}
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        className="primary-button"
-                        onClick={() => runAction("finalize", { prompt: finalizationPrompt })}
-                        disabled={actionLoading || !finalizationPrompt.trim()}
-                      >
-                        {actionLoading ? "Requesting answer…" : "Get answer for review"}
-                      </button>
-                    </div>
-                  </>
+              {runtimeUnavailable && (
+                <p className="alert" role="alert">
+                  This saved conversation is read-only because the agent runtime was restarted. Start a new session to continue.
+                </p>
+              )}
+              {interactiveMode && <div className="conversation-actions">
+                <div className="finalization-container">
+                  <label>Configured result prompt:</label>
+                  <p className="finalization-preview">{finalizationPrompt || "No expected result defined"}</p>
+                </div>
+                <p>When Agent 1 has enough context, send it this prompt to produce the result.</p>
+                <button
+                  className="primary-button"
+                  onClick={() => runAction("finalize", { prompt: finalizationPrompt })}
+                  disabled={runtimeUnavailable || actionLoading || sessionProcessing || !finalizationPrompt.trim()}
+                >
+                  {actionLoading ? "Creating result…" : "I’ve provided enough context"}
+                </button>
+                {!finalizationPrompt.trim() && (
+                  <button
+                    className="secondary-button"
+                    onClick={() => runAction("finalize-last", {})}
+                    disabled={runtimeUnavailable || actionLoading || sessionProcessing || !canUseLastAnswer}
+                  >
+                    Use last answer as result
+                  </button>
                 )}
-              </div>
+              </div>}
+              {!interactiveMode && <p className="composer-hint">Autonomous mode is creating the configured result from your initial request.</p>}
+              {interactiveMode && <>
               <form className="composer" onSubmit={sendMessage}>
                 <label className="visually-hidden" htmlFor="message">Your message</label>
                 <textarea
@@ -473,21 +529,22 @@ export default function App() {
                       event.currentTarget.form.requestSubmit();
                     }
                   }}
-                  placeholder="Describe what Agent 1 should create…"
+                  placeholder="Answer Agent 1’s questions or add more context…"
                   rows="1"
                   maxLength="20000"
-                  disabled={sessionProcessing}
+                  disabled={runtimeUnavailable || sessionProcessing || actionLoading}
                 />
                 <button
                   className="send-button"
                   type="submit"
                   aria-label="Send message"
-                  disabled={sessionProcessing || !draft.trim()}
+                  disabled={runtimeUnavailable || sessionProcessing || actionLoading || !draft.trim()}
                 >
                   ↑
                 </button>
               </form>
               <p className="composer-hint">Enter to send · Shift + Enter for a new line</p>
+              </>}
             </section>
           )}
 
@@ -495,17 +552,20 @@ export default function App() {
             <section className="review-panel" aria-label="Review Agent 1 result">
               <div className="conversation-heading">
                 <p className="eyebrow">RELEASE · REVIEW REQUIRED</p>
-                <h1>Review Agent 1’s result</h1>
-                <p className="review-intro">Agent 2 will only start after you approve this exact version.</p>
+                <h1>Review {agentName}’s result</h1>
+                <p className="review-intro">The next workflow step will only start after you approve this exact version.</p>
               </div>
               {error && <p className="alert inline-alert" role="alert">{error}</p>}
+              {runtimeUnavailable && (
+                <p className="alert" role="alert">This saved review is read-only because the agent runtime was restarted.</p>
+              )}
               {workflow.artifact_ready ? (
                 <article className="file-card">
                   <div className="file-heading">
                     <span className="file-icon" aria-hidden="true">MD</span>
                     <div>
                       <strong>{workflow.artifact_name}</strong>
-                      <span>Created by Agent 1</span>
+                      <span>Created by {agentName}</span>
                     </div>
                   </div>
                   <pre className="file-content">{workflow.artifact_content}</pre>
@@ -516,16 +576,16 @@ export default function App() {
                 </div>
               )}
               <div className="review-actions">
-                <button className="secondary-button" onClick={() => runAction("edit")} disabled={actionLoading}>
+                <button className="secondary-button" onClick={() => runAction("edit")} disabled={runtimeUnavailable || actionLoading}>
                   Continue discussion
                 </button>
-                <button className="discard-button" onClick={() => runAction("discard")} disabled={actionLoading}>
+                <button className="discard-button" onClick={() => runAction("discard")} disabled={runtimeUnavailable || actionLoading}>
                   Discard
                 </button>
                 <button
                   className="primary-button approve-button"
                   onClick={() => runAction("approve")}
-                  disabled={actionLoading || !workflow.artifact_ready}
+                  disabled={runtimeUnavailable || actionLoading || !workflow.artifact_ready}
                 >
                   {actionLoading ? "Starting…" : "Approve"}
                   {!actionLoading && <span aria-hidden="true">✓</span>}
@@ -534,12 +594,12 @@ export default function App() {
             </section>
           )}
 
-          {stage === "agent2" && (
+          {["agent1", "agent2"].includes(stage) && !interactiveMode && (
             <section className="progress-panel" aria-live="polite">
               <div className="progress-mark" aria-hidden="true"><span /><span /><span /></div>
-              <p className="eyebrow">AGENT 2 · ACTIVE</p>
-              <h1>Processing your approved result</h1>
-              <p>Agent 1 is closed. Agent 2 is working from the version you approved.</p>
+              <p className="eyebrow">{agentName.toUpperCase()} · ACTIVE</p>
+              <h1>Workflow step in progress</h1>
+              <p>{agentName} is processing its connected inputs.</p>
               {error && <p className="alert" role="alert">{error}</p>}
             </section>
           )}
@@ -548,8 +608,10 @@ export default function App() {
             <section className="progress-panel terminal-panel">
               <div className="success-mark" aria-hidden="true">✓</div>
               <p className="eyebrow">WORKFLOW COMPLETE</p>
-              <h1>Your result is ready</h1>
-              <p>Agent 2 has finished processing the approved file.</p>
+              <h1>Workflow complete</h1>
+              <div className="output-content workflow-output" aria-label="Final workflow output">
+                {workflow.output || "The workflow completed without producing output."}
+              </div>
               <button className="secondary-button" onClick={goHome}>Back to start</button>
             </section>
           )}
@@ -581,7 +643,7 @@ export default function App() {
             <>
               <p className="eyebrow">WORKFLOW</p>
               <h2>Workflow Visualization</h2>
-              <WorkflowVisualization workflow={workflow} />
+              <WorkflowVisualization workflow={workflow} onSelectNode={selectWorkflowNode} />
             </>
           ) : (
             <div className="workflow-sidebar-empty">
@@ -594,17 +656,6 @@ export default function App() {
           )}
         </aside>
       </div>
-      {stage === "complete" && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="completion-modal" role="dialog" aria-modal="true" aria-labelledby="completion-title">
-            <div className="success-mark modal-check" aria-hidden="true">✓</div>
-            <p className="eyebrow">WORKFLOW COMPLETE</p>
-            <h2 id="completion-title">Your result is ready</h2>
-            <div className="output-content">{workflow.output}</div>
-            <button className="primary-button" onClick={goHome}>Back to start <span aria-hidden="true">↗</span></button>
-          </section>
-        </div>
-      )}
     </main>
   );
 }

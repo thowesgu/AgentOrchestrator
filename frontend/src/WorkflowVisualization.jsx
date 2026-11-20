@@ -9,7 +9,7 @@ import "reactflow/dist/style.css";
 import { visualizationGraph } from "./visualizationGraph";
 import "./WorkflowVisualization.css";
 
-function WorkflowGraph({ workflow }) {
+function WorkflowGraph({ workflow, onSelectNode }) {
   const graph = visualizationGraph(workflow);
   const [nodes, , onNodesChange] = useNodesState(graph.nodes);
   const [edges, , onEdgesChange] = useEdgesState(graph.edges.map((edge) => ({
@@ -27,6 +27,7 @@ function WorkflowGraph({ workflow }) {
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable={false}
+        onNodeClick={(_, node) => onSelectNode?.(node.id)}
         fitView
       >
         <Background />
@@ -36,7 +37,7 @@ function WorkflowGraph({ workflow }) {
   );
 }
 
-export function WorkflowVisualization({ workflow }) {
+export function WorkflowVisualization({ workflow, onSelectNode }) {
   if (!Array.isArray(workflow?.nodes) || !Array.isArray(workflow?.edges)) {
     return (
       <div className="workflow-visualization-empty">
@@ -51,6 +52,13 @@ export function WorkflowVisualization({ workflow }) {
       </div>
     );
   }
-  const graphKey = JSON.stringify([workflow.nodes, workflow.edges]);
-  return <WorkflowGraph key={graphKey} workflow={workflow} />;
+  const graphKey = JSON.stringify([
+    workflow.nodes,
+    workflow.edges,
+    workflow.active_node_id,
+    workflow.active_node_ids,
+    workflow.node_statuses,
+    workflow.agent_conversations,
+  ]);
+  return <WorkflowGraph key={graphKey} workflow={workflow} onSelectNode={onSelectNode} />;
 }

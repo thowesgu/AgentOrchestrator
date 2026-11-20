@@ -9,6 +9,15 @@ from agent_orchestrator.web import create_app
 from agent_orchestrator.agent import WorkflowTransitionError
 
 
+VALID_WORKFLOW_GRAPH = {
+    "nodes": [
+        {"id": "start", "type": "start"},
+        {"id": "agent", "type": "agent"},
+    ],
+    "edges": [{"source": "start", "target": "agent"}],
+}
+
+
 class FakeStore:
     def __init__(self) -> None:
         self.agent_configs = {
@@ -19,6 +28,9 @@ class FakeStore:
 
     def agent_config(self, config_id: str) -> object | None:
         return self.agent_configs.get(config_id)
+
+    def save_agent_config(self, value: dict[str, object]) -> None:
+        self.agent_configs[value["id"]] = value
 
     def save_workflow_config(self, value: dict[str, object]) -> None:
         self.saved_workflow_configs[value["id"]] = value
@@ -54,6 +66,7 @@ class FakeAgent:
         self.stage = "agent1"
         self.store = FakeStore()
         self.saved_sessions: dict[str, dict[str, object]] = {}
+        self.last_node_id = None
 
     async def start(self) -> None:
         return None
@@ -89,14 +102,17 @@ class FakeAgent:
             raise KeyError(session_id)
         del self.saved_sessions[session_id]
 
-    async def send_message(self, session_id: str, content: str) -> list[ChatMessage]:
+    async def send_message(self, session_id: str, content: str, node_id: str | None = None) -> list[ChatMessage]:
+        self.last_node_id = node_id
         if session_id != "new-session":
             raise KeyError(session_id)
         if self.stage != "agent1":
             raise WorkflowTransitionError("Agent 1 is not active.")
         return [ChatMessage("user", content), ChatMessage("assistant", "A complete answer.")]
 
-    def get_workflow(self, session_id: str) -> dict[str, object]:
+    def get_workflow(self, session_id: str, node_id: str | None = None) -> dict[str, object]:
+        if node_id:
+            self.last_node_id = node_id
         if session_id != "new-session":
             raise KeyError(session_id)
         return {
@@ -112,11 +128,13 @@ class FakeAgent:
         self.stage = "agent1"
         return self.get_workflow(session_id)
 
-    async def finalize_result(self, session_id: str) -> dict[str, object]:
+    async def finalize_result(self, session_id: str, node_id: str | None = None) -> dict[str, object]:
+        self.last_node_id = node_id
         self.stage = "review"
         return self.get_workflow(session_id)
 
-    async def submit_for_review(self, session_id: str, prompt: str) -> dict[str, object]:
+    async def submit_for_review(self, session_id: str, prompt: str, node_id: str | None = None) -> dict[str, object]:
+        self.last_node_id = node_id
         self.stage = "review"
         return self.get_workflow(session_id)
 
@@ -145,11 +163,68 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(response.json()["messages"][0]["role"], "assistant")
         self.assertEqual(response.json()["workflow"]["stage"], "agent1")
 
+    def test_selected_branch_is_forwarded_to_message_workflow_and_finalize(self) -> None:
+        agent = self.client.app.state.agent
+        response = self.client.get("/api/sessions/new-session/workflow?node_id=branch-b")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(agent.last_node_id, "branch-b")
+        agent.stage = "agent1"
+        response = self.client.post(
+            "/api/sessions/new-session/finalize-last",
+            json={"node_id": "branch-b"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(agent.last_node_id, "branch-b")
+        agent.stage = "agent1"
+        response = self.client.post(
+            "/api/sessions/new-session/messages",
+            json={"content": "Hello", "node_id": "branch-b"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(agent.last_node_id, "branch-b")
+        response = self.client.post(
+            "/api/sessions/new-session/finalize",
+            json={"prompt": "Produce result", "node_id": "branch-b"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(agent.last_node_id, "branch-b")
+
     def test_start_screen_is_served(self) -> None:
         response = self.client.get("/")
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Copilot Chat", response.text)
+
+    def test_agent_config_saves_interaction_mode_and_result_prompt(self) -> None:
+        response = self.client.post("/api/agent-configs", json={
+            "name": "Interactive",
+            "instructions": "Discuss the task.",
+            "expected_result": "Return a project brief.",
+            "interaction_mode": "interactive",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        config_id = response.json()["id"]
+        self.assertEqual(response.json()["interaction_mode"], "interactive")
+        self.assertEqual(response.json()["expected_result"], "Return a project brief.")
+
+        updated = self.client.put(f"/api/agent-configs/{config_id}", json={
+            "name": "Autonomous",
+            "instructions": "Complete the task.",
+            "expected_result": "Return a summary.",
+            "interaction_mode": "autonomous",
+        })
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["interaction_mode"], "autonomous")
+
+    def test_autonomous_agent_requires_expected_result(self) -> None:
+        response = self.client.post("/api/agent-configs", json={
+            "name": "Autonomous",
+            "instructions": "Complete the task.",
+            "interaction_mode": "autonomous",
+        })
+
+        self.assertEqual(response.status_code, 422)
 
     def test_whitespace_message_is_rejected(self) -> None:
         response = self.client.post(
@@ -159,23 +234,104 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_workflow_config_accepts_json_objects_and_legacy_strings(self) -> None:
-        graph = {"nodes": [{"id": "a", "type": "agent"}], "edges": []}
+        graph = VALID_WORKFLOW_GRAPH
         created = self.client.post("/api/workflow-configs", json={"name": "Graph", "config": graph})
         self.assertEqual(created.status_code, 200)
         saved = created.json()
         self.assertEqual(json.loads(saved["config"]), graph)
         updated = self.client.put(
-            f"/api/workflow-configs/{saved['id']}", json={"name": "Graph", "config": '{"nodes":[],"edges":[]}'}
+            f"/api/workflow-configs/{saved['id']}",
+            json={"name": "Graph", "config": json.dumps(graph)},
         )
         self.assertEqual(updated.status_code, 200)
-        self.assertEqual(json.loads(updated.json()["config"]), {"nodes": [], "edges": []})
+        reopened = self.client.get(f"/api/workflow-configs/{saved['id']}")
+        self.assertEqual(json.loads(reopened.json()["config"]), graph)
         oversized = self.client.post("/api/workflow-configs", json={"name": "Graph", "config": {"data": "x" * 100_000}})
         self.assertEqual(oversized.status_code, 422)
+
+    def test_workflow_config_rejects_incomplete_or_cyclic_graphs(self) -> None:
+        invalid_graphs = [
+            {"nodes": [{"id": "agent", "type": "agent"}], "edges": []},
+            {
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "agent", "type": "agent"},
+                    {"id": "review", "type": "review"},
+                ],
+                "edges": [{"source": "start", "target": "agent"}],
+            },
+            {
+                "nodes": [{"id": "start", "type": "start"}, {"id": "agent", "type": "agent"}],
+                "edges": [
+                    {"source": "start", "target": "agent"},
+                    {"source": "agent", "target": "start"},
+                ],
+            },
+            {
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "source", "type": "data_source"},
+                    {"id": "agent", "type": "agent"},
+                ],
+                "edges": [
+                    {"source": "start", "target": "source"},
+                    {"source": "source", "target": "agent"},
+                ],
+            },
+            {
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "agent-1", "type": "agent"},
+                    {"id": "agent-2", "type": "agent"},
+                    {"id": "review", "type": "review"},
+                ],
+                "edges": [
+                    {"source": "start", "target": "agent-1"},
+                    {"source": "start", "target": "agent-2"},
+                    {"source": "agent-1", "target": "review"},
+                    {"source": "agent-2", "target": "review"},
+                ],
+            },
+            {
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "source", "type": "data_source"},
+                    {"id": "review", "type": "review"},
+                ],
+                "edges": [
+                    {"source": "start", "target": "source"},
+                    {"source": "source", "target": "review"},
+                ],
+            },
+        ]
+        for graph in invalid_graphs:
+            with self.subTest(graph=graph):
+                response = self.client.post(
+                    "/api/workflow-configs", json={"name": "Invalid", "config": graph}
+                )
+                self.assertEqual(response.status_code, 422)
+
+    def test_workflow_config_accepts_data_source_as_independent_root(self) -> None:
+        graph = {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "source", "type": "data_source"},
+                {"id": "agent", "type": "agent"},
+            ],
+            "edges": [
+                {"source": "start", "target": "agent"},
+                {"source": "source", "target": "agent"},
+            ],
+        }
+        response = self.client.post(
+            "/api/workflow-configs", json={"name": "With source", "config": graph}
+        )
+        self.assertEqual(response.status_code, 200)
 
     def test_constant_files_are_validated_persisted_replaceable_and_removable(self) -> None:
         workflow = self.client.post(
             "/api/workflow-configs",
-            json={"name": "Files", "config": {"nodes": [], "edges": []}},
+            json={"name": "Files", "config": VALID_WORKFLOW_GRAPH},
         ).json()
         base = f"/api/workflow-configs/{workflow['id']}/constant-files"
         upload = self.client.post(base, json={
@@ -200,7 +356,7 @@ class WebApiTests(unittest.TestCase):
     def test_constant_files_reject_unsupported_invalid_and_oversized_content(self) -> None:
         workflow = self.client.post(
             "/api/workflow-configs",
-            json={"name": "Files", "config": {"nodes": [], "edges": []}},
+            json={"name": "Files", "config": VALID_WORKFLOW_GRAPH},
         ).json()
         base = f"/api/workflow-configs/{workflow['id']}/constant-files"
         unsupported = self.client.post(

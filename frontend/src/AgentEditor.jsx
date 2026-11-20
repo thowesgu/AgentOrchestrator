@@ -6,6 +6,7 @@ export function AgentEditor({ configId, onClose, onSave }) {
     name: "",
     instructions: "",
     expected_result: "",
+    interaction_mode: "interactive",
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -28,6 +29,10 @@ export function AgentEditor({ configId, onClose, onSave }) {
   async function handleSave() {
     if (!form.name.trim() || !form.instructions.trim()) {
       setError("Name and instructions are required.");
+      return;
+    }
+    if (form.interaction_mode === "autonomous" && !form.expected_result.trim()) {
+      setError("An expected result is required for autonomous agents.");
       return;
     }
     setLoading(true);
@@ -84,14 +89,37 @@ export function AgentEditor({ configId, onClose, onSave }) {
           />
         </div>
         <div className="form-group">
-          <label>Expected Result (optional)</label>
+          <label htmlFor="interaction-mode">Interaction mode</label>
+          <select
+            id="interaction-mode"
+            value={form.interaction_mode || "interactive"}
+            onChange={(e) => setForm({ ...form, interaction_mode: e.target.value })}
+            disabled={loading}
+          >
+            <option value="interactive">Interactive</option>
+            <option value="autonomous">Autonomous</option>
+          </select>
+          <p className="field-description">
+            Interactive agents discuss the task with you until you indicate they have enough context.
+            Autonomous agents produce the configured result immediately from your request.
+          </p>
+        </div>
+        <div className="form-group">
+          <label htmlFor="expected-result">
+            Expected Result{form.interaction_mode === "autonomous" ? "" : " (optional)"}
+          </label>
           <textarea
+            id="expected-result"
             value={form.expected_result}
             onChange={(e) => setForm({ ...form, expected_result: e.target.value })}
             placeholder="Describe what the agent should output"
             rows={5}
             disabled={loading}
+            required={form.interaction_mode === "autonomous"}
           />
+          {form.interaction_mode === "autonomous" && (
+            <p className="field-description">Required for autonomous agents; this instruction is sent with the initial task.</p>
+          )}
         </div>
         <div className="editor-actions">
           <button onClick={handleSave} disabled={loading} className="save-btn">

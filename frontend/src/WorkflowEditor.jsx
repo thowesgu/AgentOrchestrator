@@ -1,17 +1,37 @@
 import { useCallback, useEffect, useState } from "react";
-import ReactFlow, { addEdge, Background, Controls, useEdgesState, useNodesState } from "reactflow";
+import ReactFlow, {
+  addEdge, Background, Controls, Handle, Position, useEdgesState, useNodesState,
+} from "reactflow";
 import "reactflow/dist/style.css";
-import { configFromGraph, graphFromConfig, NODE_TYPES, nodeStyle } from "./workflowGraph";
+import {
+  configFromGraph, flowNodeType, graphFromConfig, NODE_TYPES, nodeStyle, validateWorkflowGraph,
+} from "./workflowGraph";
 import "./WorkflowEditor.css";
 
 const MAX_FILE_BYTES = 1_048_576;
 const FILE_ACCEPT = ".txt,.md,.csv,.json,.yaml,.yml,.xml,.log";
 
+function WorkflowSourceNode({ data }) {
+  return (
+    <>
+      <Handle type="source" position={Position.Right} />
+      <span>{data.label}</span>
+    </>
+  );
+}
+
+const flowNodeTypes = { workflowSource: WorkflowSourceNode };
+
 async function readResponse(response) {
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = payload.detail;
-    throw new Error(typeof detail === "string" ? detail : "The request failed. Check the file and try again.");
+    const message = typeof detail === "string"
+      ? detail
+      : Array.isArray(detail)
+        ? detail.map((item) => item.msg).filter(Boolean).join(" ")
+        : "The request failed. Check the file and try again.";
+    throw new Error(message);
   }
   return payload;
 }
@@ -41,6 +61,7 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
   const [graphLoaded, setGraphLoaded] = useState(!configId);
   const [loadFailed, setLoadFailed] = useState(false);
   const [error, setError] = useState("");
+  const [saveMessage, setSaveMessage] = useState("");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -98,6 +119,7 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
   }, []);
 
   function addNode(type) {
+    if (type === "start" && nodes.some((node) => node.data.workflowNode.type === "start")) return;
     let number = 1;
     while (nodes.some((node) => node.id === `${type}-${number}`)) number += 1;
     const id = `${type}-${number}`;
@@ -105,7 +127,7 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
     if (type === "agent") node.agent_id = "";
     if (type === "data_source") node.source_type = "constant_file";
     setNodes((current) => [...current.map((item) => ({ ...item, selected: false })), {
-      id, position: { x: 80 + (current.length % 4) * 200, y: 80 + Math.floor(current.length / 4) * 120 },
+      id, type: flowNodeType(type), position: { x: 80 + (current.length % 4) * 200, y: 80 + Math.floor(current.length / 4) * 120 },
       data: { label: node.label, workflowNode: node }, style: nodeStyle(type), selected: true,
     }]);
     setEdges((current) => current.map((edge) => ({ ...edge, selected: false })));
@@ -115,6 +137,19 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
 
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId);
+  const selectedNodeInputs = selectedNode
+    ? edges
+      .filter((edge) => edge.target === selectedNode.id)
+      .map((edge) => {
+        const source = nodes.find((node) => node.id === edge.source);
+        return source && {
+          id: source.id,
+          label: source.data.label || source.id,
+          type: source.data.workflowNode.type,
+        };
+      })
+      .filter(Boolean)
+    : [];
 
   function updateNode(field, value) {
     const selectedFile = field === "file_id" ? constantFiles.find((file) => file.id === value) : null;
@@ -152,8 +187,15 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
   }
 
   async function handleSave() {
+    setSaveMessage("");
     if (!name.trim()) {
       setError("Name is required.");
+      return;
+    }
+    const graph = configFromGraph(config, nodes, edges);
+    const validationErrors = validateWorkflowGraph(nodes, edges);
+    if (validationErrors.length) {
+      setError(`This workflow is incomplete:\n${validationErrors.map((message) => `• ${message}`).join("\n")}`);
       return;
     }
     setLoading(true);
@@ -162,11 +204,12 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
       const response = await fetch(savedConfigId ? `/api/workflow-configs/${encodeURIComponent(savedConfigId)}` : "/api/workflow-configs", {
         method: savedConfigId ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), config: configFromGraph(config, nodes, edges) }),
+        body: JSON.stringify({ name: name.trim(), config: graph }),
       });
       const saved = await readResponse(response);
       setSavedConfigId(saved.id);
       setConfig(typeof saved.config === "string" ? JSON.parse(saved.config) : saved.config);
+      setSaveMessage("Workflow saved successfully.");
       onSave?.(saved, { keepOpen: true });
     } catch (failure) {
       setError(failure.message);
@@ -292,11 +335,15 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
         </div>
       </header>
       {error && <div className="workflow-editor-error" role="alert">{error}</div>}
+      {saveMessage && <div className="workflow-editor-success" role="status">{saveMessage}</div>}
       <div className="workflow-editor-body">
         <aside className="workflow-editor-palette">
           <h3>Add node</h3>
           {Object.entries(NODE_TYPES).map(([type, definition]) => (
-            <button key={type} onClick={() => addNode(type)} disabled={loading || fileBusy || loadFailed}>+ {definition.label}</button>
+            <button key={type} onClick={() => addNode(type)}
+              disabled={loading || fileBusy || loadFailed || (type === "start" && nodes.some((node) => node.data.workflowNode.type === "start"))}>
+              + {definition.label}{type === "start" && nodes.some((node) => node.data.workflowNode.type === "start") ? " (added)" : ""}
+            </button>
           ))}
           <p>Connect nodes by dragging between their handles. Select a node or edge to edit it.</p>
           <section className="constant-file-library" aria-label="Constant files">
@@ -348,7 +395,7 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
           </section>
         </aside>
         <div className="workflow-editor-canvas">
-          <ReactFlow key={graphLoaded ? "loaded" : "loading"} nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
+          <ReactFlow key={graphLoaded ? "loaded" : "loading"} nodes={nodes} edges={edges} nodeTypes={flowNodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
             onConnect={onConnect} nodesDraggable={!loading && !loadFailed} nodesConnectable={!loading && !loadFailed}
             elementsSelectable={!loading && !loadFailed} deleteKeyCode={loading || loadFailed ? null : ["Backspace", "Delete"]}
             onSelectionChange={onSelectionChange} fitView>
@@ -372,6 +419,16 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
                     {agentConfigs.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}
                   </select>
                 </label>
+              )}
+              {selectedNode.data.workflowNode.type === "agent" && (
+                <section className="workflow-agent-inputs" aria-label="Connected context inputs">
+                  <strong>Connected inputs provided as context</strong>
+                  {selectedNodeInputs.length ? (
+                    <ul>{selectedNodeInputs.map((input) => (
+                      <li key={input.id}>{input.label} <span>({NODE_TYPES[input.type]?.label || input.type})</span></li>
+                    ))}</ul>
+                  ) : <p>No incoming connections. Connect a data source or previous step to provide context.</p>}
+                </section>
               )}
               {selectedNode.data.workflowNode.type === "data_source" && (
                 <>
@@ -403,9 +460,6 @@ export function WorkflowEditor({ configId, onClose, onSave }) {
                 </>
               )}
               <label>Output<input value={selectedNode.data.workflowNode.output || ""} onChange={(event) => updateNode("output", event.target.value)} /></label>
-              {selectedNode.data.workflowNode.type === "agent" && (
-                <label>Inputs (comma separated)<input value={(selectedNode.data.workflowNode.inputs || []).join(",")} onChange={(event) => updateNode("inputs", event.target.value.split(","))} onBlur={() => updateNode("inputs", (selectedNode.data.workflowNode.inputs || []).map((item) => item.trim()).filter(Boolean))} /></label>
-              )}
               {selectedNode.data.workflowNode.type === "review" && (
                 <label>Input<input value={selectedNode.data.workflowNode.input || ""} onChange={(event) => updateNode("input", event.target.value)} /></label>
               )}
